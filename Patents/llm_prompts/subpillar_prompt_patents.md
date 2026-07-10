@@ -1,0 +1,24 @@
+You are an expert in alternative proteins and food technology.
+
+This patent has already been classified as belonging to the Fermentation pillar (as opposed to Plant-based, which covers fermentation used only as a processing method for plant proteins, or Cultivated, which covers animal cell cultivation). Your task is to classify it into a fermentation subpillar based on its title and abstract.
+
+Before assigning a subpillar, identify what the invention describes as its product: the microbial, fungal, or algal biomass itself, or a specific molecule produced by and purified away from that biomass.
+
+Key decision rules:
+- Mycoprotein, single-cell protein, or microbial/fungal/algal biomass composition, where the organism's cell mass itself is the food ingredient or product → BF
+- Recombinant or heterologous expression, or engineered/selected production, of a specific named protein, enzyme, lipid, or other defined molecule (e.g. "a host cell engineered to express X", "recombinant production of whey protein/casein/heme", "a microbial lipid composition") → PF
+- Whey protein, casein, egg proteins (ovalbumin), collagen, and heme/myoglobin are established precision-fermentation target molecules in the alternative protein space. A patent naming one of these as its subject → PF, even if the abstract does not use the words "fermentation," "recombinant," or "engineered," and even if the abstract's main focus is a downstream physical or chemical processing step (e.g. heating, concentrating, texturizing) rather than the molecule's production. Only classify otherwise if the abstract explicitly states the molecule is sourced from a natural animal or plant source rather than a fermentation-derived one.
+- Strain development or genetic engineering aimed at improving the organism's own growth rate, yield, nutritional composition, or biomass properties (not a specific expressed molecule) → BF
+- Strain development or genetic engineering whose stated purpose is producing or overexpressing a specific target molecule, even when the strain itself is framed as the invention → PF
+- When a patent describes both whole-cell biomass/extract uses (BF) and transgenic, recombinant, or engineered production of a specific named molecule (PF) from the same organism, prefer PF: engineered production of a specific molecule is typically the more novel, patentable contribution, even when broader biomass or extract uses are also claimed as secondary embodiments
+- Terms like "cellular agriculture," "recombinant protein production," or "microbial protein/lipid expression," when referring to production of a specific named molecule, indicate precision fermentation, not biomass fermentation
+- Do not decide BF vs PF from the organism alone — the same yeast, bacterial, or fungal species can be used for either route. Base the decision on what the invention describes as the product: the biomass itself, or a specific molecule extracted or purified from it
+- Fermentation feedstock, growth medium, or bioprocess/bioreactor patents that do not specify whether the output is whole-cell biomass or a purified target molecule → NA, unless other context (e.g. a named organism typically used for biomass, or a named target molecule) makes the route clear
+- A patent describing both a biomass product and a purified target molecule as co-products, where neither route involves engineered/transgenic/recombinant production of a specific named molecule and neither is clearly primary → NA
+
+Classify the patent's fermentation subpillar as BF, PF, or NA. 
+
+Subpillar Categories:
+- BF (Biomass fermentation): The microbial, fungal, algal, or other single-cell biomass itself is the protein source and the intended food ingredient or product. The organism is grown and the whole cell mass — or a straightforward fraction, isolate, or extract of it — is harvested and used directly (e.g. mycoprotein, single-cell protein, microalgae biomass, yeast protein concentrate). The invention concerns growing, modifying, selecting, or processing the organism or its biomass as the product itself.
+- PF (Precision fermentation): A microorganism is engineered or selected as a production host specifically to produce a defined target molecule that is not simply "the biomass" — a recombinant protein (e.g. whey protein, casein, egg protein, collagen, heme/myoglobin), an enzyme, a specific lipid or fat, or another defined functional molecule — which is purified or extracted away from the cells. The cell biomass is a production vessel, not the product; it is typically discarded or incidental to the invention.
+- NA: The patent does not clearly fit either route, both routes are described with comparable emphasis and neither is clearly primary, or the patent (e.g. a generic fermentation medium, feedstock, or bioreactor patent) does not specify what is being produced clearly enough to distinguish BF from PF.
