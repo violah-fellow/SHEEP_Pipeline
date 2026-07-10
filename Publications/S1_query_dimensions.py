@@ -62,16 +62,16 @@ def main(
         query_string = i.replace('\\"', '\"')
         
         # only pull 100 publications per search term for testing
-        query.append(dsl.query(f"""search publications in title_abstract_only for "{dsl_escape(query_string)}"
-                            where year={YEAR} 
-                            return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
-                            funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]
-                            limit 100"""))
-        
-        # query.append(dsl.query_iterative(f"""search publications in title_abstract_only for "{dsl_escape(query_string)}"
+        # query.append(dsl.query(f"""search publications in title_abstract_only for "{dsl_escape(query_string)}"
         #                     where year={YEAR} 
         #                     return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
-        #                     funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]"""))
+        #                     funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]
+        #                     limit 100"""))
+        
+        query.append(dsl.query_iterative(f"""search publications in title_abstract_only for "{dsl_escape(query_string)}"
+                            where year={YEAR} 
+                            return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
+                            funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]"""))
 
     # Convert to pandas dataframe and deduplicate by id
     query_df = pd.concat([q.as_dataframe() for q in query], ignore_index=True)

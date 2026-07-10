@@ -71,28 +71,28 @@ def main(
     print("\nStart reverse query")
 
     # only pull 100 publications per search term for testing
+    # query = []
+    # for batch in chunks(family_ids, 500):
+    #     q = dsl.query(f"""search patents
+    #       where family_id in {json.dumps(batch)}
+    #       return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
+    #                     publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
+    #                     assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
+    #                     publications+researchers+times_cited+family_count]
+    #       limit 100 """)
+    #     query.append(q)
+
+    # full query
     query = []
     for batch in chunks(family_ids, 500):
-        q = dsl.query(f"""search patents
-          where family_id in {json.dumps(batch)}
-          return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
+        q = dsl.query_iterative(f"""search patents
+        where family_id in {json.dumps(batch)}
+        return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
                         publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
                         assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
                         publications+researchers+times_cited+family_count]
-          limit 100 """)
+        """)
         query.append(q)
-
-    # full query
-    # query = []
-    # for batch in chunks(family_ids, 500):
-    #     q = dsl.query_iterative(f"""search patents
-    #       where family_id in {json.dumps(batch)}
-    #       return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
-    #                      publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
-    #                      assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
-    #                      publications+researchers+times_cited+family_count]
-    #       """)
-    #     query.append(q)
 
     # Convert to pandas dataframe and deduplicate by id    
     query_df = pd.concat([q.as_dataframe() for q in query], ignore_index=True)

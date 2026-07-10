@@ -74,45 +74,45 @@ def main(
         
         # only pull 100 patents per search term for testing
 
-        # string search
-        query.append(dsl.query(f"""search patents for "{dsl_escape(query_string)}"
-                               where publication_year={YEAR} 
-                               return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
-                                publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
-                                assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
-                                publications+researchers+times_cited+family_count] 
-                               limit 100"""))
-        
-    # CPC code search
-    query.append(dsl.query(f"""search patents 
-                            where cpc in {json.dumps(cpc_search)}
-                            and publication_year={YEAR} 
-                            return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
-                            publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
-                            assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
-                            publications+researchers+times_cited+family_count]
-                            limit 100"""))
-        
-        # full search
-
-        # # string search
-        # query.append(dsl.query_iterative(f"""search patents for "{dsl_escape(query_string)}"
-        #                        where publication_year={YEAR} 
-        #                        return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
-        #                         publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
-        #                         assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
-        #                         publications+researchers+times_cited+family_count] 
-        #             """))
+    #     # string search
+    #     query.append(dsl.query(f"""search patents for "{dsl_escape(query_string)}"
+    #                            where publication_year={YEAR} 
+    #                            return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
+    #                             publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
+    #                             assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
+    #                             publications+researchers+times_cited+family_count] 
+    #                            limit 100"""))
         
     # # CPC code search
-    # query.append(dsl.query_iterative(f"""search patents 
-    #                        where cpc in {json.dumps(cpc_search)}
-    #                        and publication_year={YEAR} 
-    #                        return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
+    # query.append(dsl.query(f"""search patents 
+    #                         where cpc in {json.dumps(cpc_search)}
+    #                         and publication_year={YEAR} 
+    #                         return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
     #                         publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
     #                         assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
     #                         publications+researchers+times_cited+family_count]
-    #             """))
+    #                         limit 100"""))
+        
+        # full search
+
+        # string search
+        query.append(dsl.query_iterative(f"""search patents for "{dsl_escape(query_string)}"
+                            where publication_year={YEAR} 
+                            return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
+                                publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
+                                assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
+                                publications+researchers+times_cited+family_count] 
+                    """))
+        
+    # CPC code search
+    query.append(dsl.query_iterative(f"""search patents 
+                        where cpc in {json.dumps(cpc_search)}
+                        and publication_year={YEAR} 
+                        return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
+                            publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
+                            assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
+                            publications+researchers+times_cited+family_count]
+                """))
 
     # Convert to pandas dataframe  
     query_df = pd.concat([q.as_dataframe() for q in query], ignore_index=True)

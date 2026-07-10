@@ -101,18 +101,18 @@ def main(
     print("\nStart reverse query")
 
     # only pull 100 publications per search term for testing
-    query = dsl.query(f"""search publications
-                        where researchers in {researcher_ids}
-                        and year={YEAR} 
-                        return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
-                            funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]
-                        limit 10""")
+    # query = dsl.query(f"""search publications
+    #                     where researchers in {researcher_ids}
+    #                     and year={YEAR} 
+    #                     return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
+    #                         funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]
+    #                     limit 10""")
     
-    # query = dsl.query_iterative(f"""search publications 
-    #                   where researchers.id in {researcher_ids} 
-    #                   and year={YEAR} 
-    #                   return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
-    #                   funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]""")
+    query = dsl.query_iterative(f"""search publications 
+                      where researchers.id in {researcher_ids} 
+                      and year={YEAR} 
+                      return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
+                      funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]""")
 
     # Convert to pandas dataframe and deduplicate by id
     query_df = query.as_dataframe()
