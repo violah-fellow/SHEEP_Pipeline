@@ -109,7 +109,7 @@ def main(
         data = db.sql(f"SELECT * FROM {RUN_TABLE}").df()
         print(f"{len(data)} rows loaded from '{RUN_TABLE}'")
 
-        data = data[data['pred_combined'] == 'in'].reset_index(drop=True)
+        data = data[data['pred_combined'] == 1].reset_index(drop=True)
         print(f"{len(data)} rows flagged as in scope by ML, sending to LLM.")
 
         if len(data) == 0:
@@ -244,6 +244,21 @@ def main(
         'date_LLM':          'VARCHAR',
     }
     results_df = results_df.reindex(columns=['id'] + list(llm_columns.keys()))
+
+    # NaN/non-bool values in these columns cause DuckDB to fail casting to BOOL;
+    # convert explicitly to pandas nullable boolean (NaN/unknown → pd.NA → NULL)
+    def _safe_bool(x):
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return pd.NA
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, str):
+            return x.lower() not in ('false', '0', 'no', '')
+        return bool(x)
+
+    for col in ('plant_based_LLM', 'fermentation_LLM', 'cultivated_LLM', 'cross_cutting_LLM'):
+        if col in results_df.columns:
+            results_df[col] = pd.array([_safe_bool(x) for x in results_df[col]], dtype='boolean')
 
     for table in (RUN_TABLE, CLASSIFICATION_TABLE):
         existing_tables = db.sql("SHOW TABLES").df()['name'].tolist()

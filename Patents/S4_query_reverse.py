@@ -21,7 +21,8 @@ CLASSIFICATION_TABLE = 'patents_classified'
 
 # Queries
 # Other parameters for search
-YEAR = 2025
+YEAR_FROM = 2023
+YEAR_TO   = 2024
 # ...
 
 # START OF SCRIPT
@@ -32,7 +33,8 @@ def main(
     RUN_TABLE=RUN_TABLE,
     REVERSE_TABLE=REVERSE_TABLE,
     CLASSIFICATION_TABLE=CLASSIFICATION_TABLE,
-    YEAR=YEAR,
+    YEAR_FROM=YEAR_FROM,
+    YEAR_TO=YEAR_TO,
 ):
     # import packages
     from dotenv import load_dotenv
@@ -60,7 +62,7 @@ def main(
 
     # Filter for in scope patents and retrieve family ID's
     run_data = run_data[run_data['pred_combined'] == 1]
-    family_ids = run_data['family_id'].tolist()
+    family_ids = run_data['family_id'].dropna().astype(int).tolist()
 
     # Function to batch family ID's    
     def chunks(list, n):
@@ -74,7 +76,7 @@ def main(
     # query = []
     # for batch in chunks(family_ids, 500):
     #     q = dsl.query(f"""search patents
-    #       where family_id in {json.dumps(batch)}
+    #       where family_id in {json.dumps(batch)} and publication_year in [{YEAR_FROM}:{YEAR_TO}] 
     #       return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
     #                     publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
     #                     assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
@@ -86,7 +88,7 @@ def main(
     query = []
     for batch in chunks(family_ids, 500):
         q = dsl.query_iterative(f"""search patents
-        where family_id in {json.dumps(batch)}
+        where family_id in {json.dumps(batch)} and publication_year in [{YEAR_FROM}:{YEAR_TO}] 
         return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
                         publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
                         assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+

@@ -25,7 +25,8 @@ CPC_SEARCH_FILE = 'CPC_for_query.txt'
 CPC_FILTER_FILE = 'CPC_for_filter.txt'
 
 # Other parameters for search
-YEAR = 2025
+YEAR_FROM = 2023
+YEAR_TO   = 2024
 # ...
 
 # START OF SCRIPT
@@ -38,7 +39,8 @@ def main(
     STRINGS_FILE=STRINGS_FILE,
     CPC_SEARCH_FILE=CPC_SEARCH_FILE,
     CPC_FILTER_FILE=CPC_FILTER_FILE,
-    YEAR=YEAR,
+    YEAR_FROM=YEAR_FROM,
+    YEAR_TO=YEAR_TO,
 ):
     # import packages
     from dotenv import load_dotenv
@@ -76,7 +78,7 @@ def main(
 
     #     # string search
     #     query.append(dsl.query(f"""search patents for "{dsl_escape(query_string)}"
-    #                            where publication_year={YEAR} 
+    #                            where publication_year in [{YEAR_FROM}:{YEAR_TO}] 
     #                            return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
     #                             publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
     #                             assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
@@ -86,7 +88,7 @@ def main(
     # # CPC code search
     # query.append(dsl.query(f"""search patents 
     #                         where cpc in {json.dumps(cpc_search)}
-    #                         and publication_year={YEAR} 
+    #                         and publication_year in [{YEAR_FROM}:{YEAR_TO}] 
     #                         return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
     #                         publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
     #                         assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
@@ -97,7 +99,7 @@ def main(
 
         # string search
         query.append(dsl.query_iterative(f"""search patents for "{dsl_escape(query_string)}"
-                            where publication_year={YEAR} 
+                            where publication_year in [{YEAR_FROM}:{YEAR_TO}] 
                             return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
                                 publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
                                 assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+
@@ -107,7 +109,7 @@ def main(
     # CPC code search
     query.append(dsl.query_iterative(f"""search patents 
                         where cpc in {json.dumps(cpc_search)}
-                        and publication_year={YEAR} 
+                        and publication_year in [{YEAR_FROM}:{YEAR_TO}]  
                         return patents[id+family_id+application_number+title+abstract+cpc+jurisdiction+kind+year+priority_year+
                             publication_year+granted_year+filing_status+legal_status+inventor_names+original_assignee_names+current_assignee_names+
                             assignee_names+assignee_cities+assignee_countries+associated_grant_ids+funders+funder_countries+federal_support+

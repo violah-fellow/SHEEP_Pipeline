@@ -21,7 +21,8 @@ CLASSIFICATION_TABLE = 'publications_classified'
 
 # Queries
 # Other parameters for search
-YEAR = 2025
+YEAR_FROM = 2025
+YEAR_TO   = 2025
 # ...
 
 # START OF SCRIPT
@@ -32,7 +33,8 @@ def main(
     RUN_TABLE=RUN_TABLE,
     REVERSE_TABLE=REVERSE_TABLE,
     CLASSIFICATION_TABLE=CLASSIFICATION_TABLE,
-    YEAR=YEAR,
+    YEAR_FROM=YEAR_FROM,
+    YEAR_TO=YEAR_TO
 ):
     # import packages
     from dotenv import load_dotenv
@@ -103,14 +105,14 @@ def main(
     # only pull 100 publications per search term for testing
     # query = dsl.query(f"""search publications
     #                     where researchers in {researcher_ids}
-    #                     and year={YEAR} 
+    #                     and year in [{YEAR_FROM}:{YEAR_TO}]  
     #                     return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
     #                         funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]
     #                     limit 10""")
     
     query = dsl.query_iterative(f"""search publications 
                       where researchers.id in {researcher_ids} 
-                      and year={YEAR} 
+                      and year in [{YEAR_FROM}:{YEAR_TO}]  
                       return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
                       funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]""")
 

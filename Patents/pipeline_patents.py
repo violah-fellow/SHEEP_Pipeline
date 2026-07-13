@@ -32,7 +32,8 @@ KEY_PATH          = '../.env'
 STRINGS_FILE    = 'dimensions_search_patents.txt'
 CPC_SEARCH_FILE = 'CPC_for_query.txt'
 CPC_FILTER_FILE = 'CPC_for_filter.txt'
-YEAR            = 2025
+YEAR_FROM       = 2023
+YEAR_TO         = 2024
 
 # Training
 TRAINING_TABLE        = 'patents_raw'
@@ -102,7 +103,8 @@ else:
         'STRINGS_FILE':           STRINGS_FILE,
         'CPC_SEARCH_FILE':        CPC_SEARCH_FILE,
         'CPC_FILTER_FILE':        CPC_FILTER_FILE,
-        'YEAR':                   YEAR,
+        'YEAR_FROM':              YEAR_FROM,
+        'YEAR_TO':                YEAR_TO,
         'SCOPE_MODEL_PATH':       SCOPE_MODEL_PATH,
         'PILLAR_MODEL_PATH':      PILLAR_MODEL_PATH,
         'THRESHOLD_PATH':         THRESHOLD_PATH,
@@ -166,7 +168,8 @@ if status['steps']['query'] != 'done':
         STRINGS_FILE=cfg['STRINGS_FILE'],
         CPC_SEARCH_FILE=cfg['CPC_SEARCH_FILE'],
         CPC_FILTER_FILE=cfg['CPC_FILTER_FILE'],
-        YEAR=cfg['YEAR'],
+        YEAR_FROM=cfg['YEAR_FROM'],
+        YEAR_TO=cfg['YEAR_TO'],
     )
     mark_done(status, 'query', STATUS_DIR)
 else:
@@ -197,7 +200,6 @@ if status['steps']['llm_scope'] != 'done':
         DB_PATH=cfg['DB_PATH'],
         RUN_TABLE=cfg['RUN_TABLE'],
         CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
-        THRESHOLD_PATH=cfg['THRESHOLD_PATH'],
         PROMPT_PATH=cfg['PROMPT_PATH'],
         LLM_MODEL_SCOPE=cfg['LLM_MODEL_SCOPE'],
         BATCH_DIR=cfg['BATCH_DIR'],
@@ -216,7 +218,8 @@ if status['steps']['reverse_query'] != 'done':
         RUN_TABLE=cfg['RUN_TABLE'],
         CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
         REVERSE_TABLE=cfg['REVERSE_TABLE'],
-        YEAR=cfg['YEAR'],
+        YEAR_FROM=cfg['YEAR_FROM'],
+        YEAR_TO=cfg['YEAR_TO'],
     )
     mark_done(status, 'reverse_query', STATUS_DIR)
 else:

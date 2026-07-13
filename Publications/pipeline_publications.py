@@ -28,7 +28,8 @@ KEY_PATH          = '../.env' # or '../../.env' if running from the pipeline fol
 
 # Query
 STRINGS_FILE = 'dimensions_search_publications.txt'
-YEAR         = 2025
+YEAR_FROM    = 2023
+YEAR_TO      = 2024
 
 # GenAI
 LLM_MODEL_SCOPE = 'claude-sonnet-4-6'   # or 'claude-haiku-4-5' for cheap test runs
@@ -84,7 +85,8 @@ else:
         'RUN_TABLE':              RUN_TABLE,
         'REVERSE_TABLE':          REVERSE_TABLE,
         'STRINGS_FILE':           STRINGS_FILE,
-        'YEAR':                   YEAR,
+        'YEAR_FROM':              YEAR_FROM,
+        'YEAR_TO':                YEAR_TO,
         'SCOPE_MODEL_PATH':       SCOPE_MODEL_PATH,
         'PILLAR_MODEL_PATH':      PILLAR_MODEL_PATH,
         'THRESHOLD_PATH':         THRESHOLD_PATH,
@@ -139,7 +141,8 @@ if status['steps']['query'] != 'done':
         DB_PATH=cfg['DB_PATH'],
         RUN_TABLE=cfg['RUN_TABLE'],
         STRINGS_FILE=cfg['STRINGS_FILE'],
-        YEAR=cfg['YEAR'],
+        YEAR_FROM=cfg['YEAR_FROM'],
+        YEAR_TO=cfg['YEAR_TO'],
     )
     mark_done(status, 'query', STATUS_DIR)
 else:
@@ -183,7 +186,8 @@ if status['steps']['reverse_query'] != 'done':
         DB_PATH=cfg['DB_PATH'],
         RUN_TABLE=cfg['RUN_TABLE'],
         REVERSE_TABLE=cfg['REVERSE_TABLE'],
-        YEAR=cfg['YEAR'],
+        YEAR_FROM=cfg['YEAR_FROM'],
+        YEAR_TO=cfg['YEAR_TO'],
     )
     mark_done(status, 'reverse_query', STATUS_DIR)
 else:

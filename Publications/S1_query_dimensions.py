@@ -22,7 +22,8 @@ CLASSIFICATION_TABLE = 'publications_classified'
 # path to txt file with search strings
 STRINGS_FILE = 'dimensions_search_publications.txt'
 # Other parameters for search
-YEAR = 2025
+YEAR_FROM = 2025
+YEAR_TO   = 2025
 # ...
 
 # START OF SCRIPT
@@ -32,7 +33,8 @@ def main(
     DB_PATH=DB_PATH,
     RUN_TABLE=RUN_TABLE,
     STRINGS_FILE=STRINGS_FILE,
-    YEAR=YEAR,
+    YEAR_FROM=YEAR_FROM,
+    YEAR_TO=YEAR_TO
 ):
     # import packages
     from dotenv import load_dotenv
@@ -63,19 +65,19 @@ def main(
         
         # only pull 100 publications per search term for testing
         # query.append(dsl.query(f"""search publications in title_abstract_only for "{dsl_escape(query_string)}"
-        #                     where year={YEAR} 
+        #                     where year in [{YEAR_FROM}:{YEAR_TO}] 
         #                     return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
         #                     funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]
         #                     limit 100"""))
         
         query.append(dsl.query_iterative(f"""search publications in title_abstract_only for "{dsl_escape(query_string)}"
-                            where year={YEAR} 
+                            where year in [{YEAR_FROM}:{YEAR_TO}] 
                             return publications[id+title+abstract+year+type+authors+concepts_relevant+date+funders+
                             funder_countries+journal+open_access+research_org_names+research_org_countries+research_org_cities+times_cited]"""))
 
     # Convert to pandas dataframe and deduplicate by id
     query_df = pd.concat([q.as_dataframe() for q in query], ignore_index=True)
-    print(f"\n{len(query_df)} patents retrieved from dimensions.")
+    print(f"\n{len(query_df)} publications retrieved from dimensions.")
 
     query_df = query_df.drop_duplicates(subset="id").reset_index(drop=True)
     query_df['date_dimensions'] = datetime.today().strftime('%y%m%d')
@@ -84,7 +86,7 @@ def main(
     # Filter for articles
     query_df = query_df[query_df['type'] == 'article']
 
-    print(f"\n{len(query_df)} patents remain after deduplication and filtering for articles.")
+    print(f"\n{len(query_df)} publications remain after deduplication and filtering for articles.")
 
     # Filter publications that already are in the final database
     # Connect to SQL database
