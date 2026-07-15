@@ -6,6 +6,7 @@ Publications/status_logs/*
 Publications/run_logs/*
 Publications/__pycache__/*
 Publications/publications.db
+Publications/publications.db.wal
 
 Patents/data/*
 Patents/embeddings/*
@@ -14,6 +15,7 @@ Patents/status_logs/*
 Patents/run_logs/*
 Patents/__pycache__/*
 Patents/patents.db
+Patents/patents.db.wal
 
 .env
 .claude/*
