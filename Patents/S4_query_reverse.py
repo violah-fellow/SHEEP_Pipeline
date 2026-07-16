@@ -96,12 +96,16 @@ def main(
         """)
         query.append(q)
 
-    # Convert to pandas dataframe and deduplicate by id    
+    # Convert to pandas dataframe    
     query_df = pd.concat([q.as_dataframe() for q in query], ignore_index=True)
+    print(f"\n{len(query_df)} patents retrieved from dimensions.")
+
+    # deduplicate by id
     query_df = query_df.drop_duplicates(subset="id").reset_index(drop=True)
 
     # Remove version duplicates of the same patent
     query_df = query_df.sort_values(['publication_year', 'kind'], ascending=[False, False]).groupby(["family_id", "jurisdiction", "application_number"]).head(1)
+    print(f"\n{len(query_df)} patents remain after deduplication.")
 
     # clean abstract
     query_df['abstract'] = query_df['abstract'].str.replace(r'<[^>]*>', '', regex=True)
