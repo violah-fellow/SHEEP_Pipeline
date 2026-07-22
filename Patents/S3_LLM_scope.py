@@ -110,12 +110,31 @@ def main(
         print(f"{len(data)} rows loaded from '{RUN_TABLE}'")
 
         data = data[data['pred_combined'] == 1].reset_index(drop=True)
-        print(f"{len(data)} rows flagged as in scope by ML, sending to LLM.")
+        print(f"{len(data)} rows flagged as in scope by ML.")
 
         if len(data) == 0:
             print("No rows to submit. Skipping batch.")
             db.close()
             return
+
+        # Select one representative per family (prefer patents with title+abstract,
+        # then preferred jurisdictions, then newest) — same logic as S2_ML_classification.
+        def select_patent(group):
+            preferred_jurisdictions = ['WO', 'EP', 'US']
+            has_content = group[
+                group['title'].notna() & group['abstract'].notna() &
+                (group['title'] != '') & (group['abstract'] != '')
+            ].copy()
+            if has_content.empty:
+                return group.sort_values('publication_year', ascending=False).head(1)
+            has_content['_preferred'] = has_content['jurisdiction'].isin(preferred_jurisdictions)
+            has_content = has_content.sort_values(
+                ['_preferred', 'publication_year'], ascending=[False, False]
+            )
+            return has_content.drop_duplicates(subset=['title', 'abstract']).head(1).drop(columns='_preferred')
+
+        reps = data.groupby('family_id', group_keys=True).apply(select_patent).reset_index(level=0).reset_index(drop=True)
+        print(f"{len(reps)} representative patents selected from {data['family_id'].nunique()} families, sending to LLM.")
 
         # 3. Build and submit batch requests
         with open(PROMPT_PATH, "r", encoding="utf-8") as f:
@@ -142,7 +161,7 @@ def main(
                 }
             }
 
-        batch_requests = [build_batch_request(row) for _, row in data.iterrows()]
+        batch_requests = [build_batch_request(row) for _, row in reps.iterrows()]
 
         print("\nSubmitting batch")
         batch = client.messages.batches.create(requests=batch_requests)
@@ -154,8 +173,8 @@ def main(
             "batch_id": batch_id,
             "run_table": RUN_TABLE,
             "model": LLM_MODEL_SCOPE,
-            "n_records": len(data),
-            "dataset_ids": data["id"].tolist(),
+            "n_records": len(reps),
+            "dataset_ids": reps["id"].tolist(),
             "created_at": datetime.now().isoformat(),
         }
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -227,6 +246,23 @@ def main(
     # store retrieval date in batch metadata so the log reflects when results were collected
     metadata["date_LLM"] = date_LLM
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    # 5b. Propagate LLM results from representative to all family members.
+    # Load the family_id for each representative, then join to all in-scope patents in the run table.
+    llm_cols_list = [c for c in results_df.columns if c != 'id']
+    run_data = db.sql(f"SELECT id, family_id FROM {RUN_TABLE} WHERE pred_combined = 1").df()
+    rep_families = db.sql(f"SELECT id, family_id FROM {RUN_TABLE}").df()
+    # map each representative id → family_id, then join results to all family members
+    results_with_family = results_df.merge(
+        rep_families.rename(columns={'id': 'rep_id', 'family_id': 'family_id'}),
+        left_on='id', right_on='rep_id', how='left'
+    ).drop(columns='rep_id')
+    results_propagated = run_data.merge(
+        results_with_family[['family_id'] + llm_cols_list],
+        on='family_id', how='left'
+    )
+    results_df = results_propagated[['id'] + llm_cols_list].copy()
+    print(f"LLM results propagated to {len(results_df)} in-scope patents across {results_with_family['family_id'].nunique()} families.")
 
     # 6. Write results back to RUN_TABLE and CLASSIFICATION_TABLE
     print(f"\nUpdating '{RUN_TABLE}' with LLM columns.")

@@ -173,6 +173,29 @@ def _normalise_category(value, categories):
     return {c.lower(): c for c in categories}.get(value.strip().lower())
 
 
+def _select_representative_patent(group):
+    # same selection logic as S2_ML_classification.py / S3_LLM_scope2.py: prefer a member with
+    # both title and abstract present, then a preferred jurisdiction, then the newest version
+    preferred_jurisdictions = ['WO', 'EP', 'US']
+    has_content = group[
+        group['title'].notna() & group['abstract'].notna() &
+        (group['title'] != '') & (group['abstract'] != '')
+    ].copy()
+    if has_content.empty:
+        return group.sort_values('publication_year', ascending=False).head(1)
+    has_content['_preferred'] = has_content['jurisdiction'].isin(preferred_jurisdictions)
+    has_content = has_content.sort_values(
+        ['_preferred', 'publication_year'], ascending=[False, False]
+    )
+    return has_content.drop_duplicates(subset=['title', 'abstract']).head(1).drop(columns='_preferred')
+
+
+def _family_group_key(df):
+    # groups by family_id, with patents lacking a family_id (NaN) falling back to their own id
+    # so they each remain a singleton group rather than being silently merged with one another
+    return df['family_id'].where(df['family_id'].notna(), df['id'])
+
+
 def main(
     KEY_PATH=KEY_PATH,
     DB_PATH=DB_PATH,
@@ -333,10 +356,21 @@ def main(
                 print(f"No new rows to label for '{label_type}'.")
                 continue
 
-            # 3. Build and submit batch requests. Grouped label types (category) pick a
-            # pillar-specific prompt/tool per row; ungrouped types (endproduct, ingredient) use
-            # the single prompt/tool for every row.
+            # 3. Select one representative patent per (family, curated pillar) group and send
+            # only that one to the LLM — mirrors S2_ML_classification.py / S3_LLM_scope2.py.
+            # Grouping includes pillar_curated (not just family_id) so a representative is
+            # never used to label a family member that was curated into a different pillar
+            # (which would apply the wrong prompt/category enum).
             data['_group'] = data[PILLAR_COL] if cfg['grouped_by_pillar'] else _UNGROUPED
+            data['_family_group_key'] = _family_group_key(data)
+
+            reps = (
+                data.groupby(['_family_group_key', PILLAR_COL], group_keys=False)
+                .apply(_select_representative_patent)
+                .reset_index(drop=True)
+            )
+            print(f"{len(reps)} representative patents selected from {len(data)} candidates "
+                  f"for '{label_type}', sending to LLM.")
 
             system_prompts = {}
             tools = {}
@@ -370,7 +404,7 @@ def main(
                     }
                 }
 
-            batch_requests = [build_batch_request(row) for _, row in data.iterrows()]
+            batch_requests = [build_batch_request(row) for _, row in reps.iterrows()]
 
             print("\nSubmitting batch")
             batch = client.messages.batches.create(requests=batch_requests)
@@ -383,10 +417,10 @@ def main(
                 "run_label": run_label,
                 "label_type": label_type,
                 "model": LLM_MODEL_LABEL,
-                "n_records": len(data),
-                "dataset_ids": data["id"].tolist(),
+                "n_records": len(reps),
+                "dataset_ids": reps["id"].tolist(),
                 # persisted so the resume path can still normalise categories per group
-                "group_by_id": dict(zip(data["id"], data['_group'])),
+                "group_by_id": dict(zip(reps["id"], reps['_group'])),
                 "created_at": datetime.now().isoformat(),
             }
             metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -438,7 +472,34 @@ def main(
         n_ok = (results_df[status_col] == "ok").sum()
         print(f"Results: {len(results_df)} total, {n_ok} succeeded.")
 
-        # 6. Write diagnostic columns for this label type back to CLASSIFICATION_TABLE. 
+        # 5b. Propagate each representative's result to every other currently-eligible patent
+        # in its (family, curated pillar) group. Re-derived fresh from CLASSIFICATION_TABLE
+        # (rather than reusing the in-memory 'data'/'reps' from submission) so this works
+        # identically whether this batch was just submitted or is being resumed on a later run.
+        with duckdb.connect(database=DB_PATH) as db:
+            eligible = db.sql(f"SELECT * FROM {CLASSIFICATION_TABLE}").df()
+        eligible = eligible[eligible[SCOPE_COL] == 'in'].reset_index(drop=True)
+        eligible = eligible[eligible[PILLAR_COL].isin(RECOGNISED_PILLARS)].reset_index(drop=True)
+        if status_col in eligible.columns:
+            eligible = eligible[eligible[status_col] != 'ok'].reset_index(drop=True)
+        restrict_to = cfg.get('restrict_to_pillars')
+        if restrict_to is not None:
+            eligible = eligible[eligible[PILLAR_COL].isin(restrict_to)].reset_index(drop=True)
+        eligible['_family_group_key'] = _family_group_key(eligible)
+
+        rep_groups = eligible.loc[eligible['id'].isin(results_df['id']), ['id', '_family_group_key']]
+        rep_groups = rep_groups.rename(columns={'id': '_rep_id'})
+        results_df = results_df.merge(rep_groups, left_on='id', right_on='_rep_id', how='left').drop(columns='_rep_id')
+
+        diag_cols = [c for c in results_df.columns if c not in ('id', '_family_group_key')]
+        n_reps = len(results_df)
+        results_df = eligible[['id', '_family_group_key']].merge(
+            results_df[['_family_group_key'] + diag_cols], on='_family_group_key', how='inner'
+        ).drop(columns='_family_group_key')
+        print(f"'{label_type}' labels propagated from {n_reps} LLM calls to {len(results_df)} "
+              f"patents sharing the same (family, pillar) group.")
+
+        # 6. Write diagnostic columns for this label type back to CLASSIFICATION_TABLE.
         print(f"\nUpdating '{CLASSIFICATION_TABLE}' with {label_type} columns.")
 
         with duckdb.connect(database=DB_PATH) as db:

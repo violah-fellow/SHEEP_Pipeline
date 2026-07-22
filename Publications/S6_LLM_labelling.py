@@ -15,7 +15,7 @@ KEY_PATH = '../.env'
 
 # Database
 # path to DuckDB database
-DB_PATH = 'publications_llmtesting.db'
+DB_PATH = 'publications.db'
 # table with in-scope, pillar-classified publications to label (working table; gets LLM
 # diagnostic columns added to it, same pattern as S3_LLM_scope.py)
 CLASSIFICATION_TABLE = 'publications_classified'

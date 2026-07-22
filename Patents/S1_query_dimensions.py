@@ -124,7 +124,7 @@ def main(
     query_df = query_df.drop_duplicates(subset="id").reset_index(drop=True)
 
     # Remove version duplicates of the same patent
-    query_df = query_df.sort_values(['publication_year', 'kind'], ascending=[False, False]).groupby(["family_id", "jurisdiction", "application_number"]).head(1)
+    query_df = query_df.sort_values(['publication_year', 'kind'], ascending=[False, False]).groupby(["family_id", "jurisdiction", "priority_year"]).head(1)
     print(f"\n{len(query_df)} patents remain after deduplication.")
 
     # clean abstract
@@ -156,14 +156,14 @@ def main(
         print(f"{n_before - len(query_df)} rows already in {CLASSIFICATION_TABLE}.")
 
         # Check for newer versions of already-classified patents
-        # (same family/jurisdiction/application combo but higher publication_year)
+        # (same family/jurisdiction/priority_year combo but higher publication_year)
         existing_versions = db.sql(f"""
-            SELECT family_id, jurisdiction, application_number, publication_year AS publication_year_existing, id AS id_existing
+            SELECT family_id, jurisdiction, priority_year, publication_year AS publication_year_existing, id AS id_existing
             FROM {CLASSIFICATION_TABLE}
         """).df()
 
         version_matches = query_df.merge(
-            existing_versions, on=['family_id', 'jurisdiction', 'application_number'], how='inner'
+            existing_versions, on=['family_id', 'jurisdiction', 'priority_year'], how='inner'
         )
 
         newer = version_matches[version_matches['publication_year'] > version_matches['publication_year_existing']]
