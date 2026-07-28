@@ -33,6 +33,11 @@ TEMPERATURE = 0.0
 # Batch
 # directory for batch submission metadata, keyed by RUN_TABLE (allows resuming without resubmitting)
 BATCH_DIR = 'batch_jobs'
+# max requests per batch submission - a single submission of thousands of requests (tens of MB
+# of JSON, since the system prompt and tool definition are repeated per request) is prone to
+# gateway/proxy timeouts, so large runs are split into chunks of this size and submitted as
+# separate batches
+BATCH_CHUNK_SIZE = 500
 # how often to check whether the batch has finished
 POLL_INTERVAL_SECONDS = 600
 
@@ -79,6 +84,7 @@ def main(
     MAX_TOKENS=MAX_TOKENS,
     TEMPERATURE=TEMPERATURE,
     BATCH_DIR=BATCH_DIR,
+    BATCH_CHUNK_SIZE=BATCH_CHUNK_SIZE,
     POLL_INTERVAL_SECONDS=POLL_INTERVAL_SECONDS,
 ):
     import time
@@ -123,10 +129,10 @@ def main(
 
     # 3. Load input data
     if metadata_path.exists():
-        # A batch for this run was already submitted; resume from its metadata instead of resubmitting.
+        # Batch(es) for this run were already submitted; resume from their metadata instead of resubmitting.
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        batch_id = metadata["batch_id"]
-        print(f"Found existing batch for '{RUN_TABLE}': {batch_id}. Resuming without resubmitting.")
+        batch_ids = [b["batch_id"] for b in metadata["batches"]]
+        print(f"Found {len(batch_ids)} existing batch(es) for '{RUN_TABLE}': {batch_ids}. Resuming without resubmitting.")
     else:
         data = db.sql(f"SELECT * FROM {DEDUP_TABLE}").df()
         print(f"{len(data)} rows loaded from '{DEDUP_TABLE}'")
@@ -162,55 +168,68 @@ def main(
             }
 
         batch_requests = [build_batch_request(row) for _, row in data.iterrows()]
+        grant_ids = data["Grant ID"].tolist()
 
-        print("\nSubmitting batch")
-        batch = client.messages.batches.create(requests=batch_requests)
-        batch_id = batch.id
-        print(f"Batch ID: {batch_id}")
-        print(f"Status:   {batch.processing_status}")
+        print(f"\nSubmitting {len(batch_requests)} requests in chunks of {BATCH_CHUNK_SIZE}")
+        batches_metadata = []
+        for start in range(0, len(batch_requests), BATCH_CHUNK_SIZE):
+            chunk = batch_requests[start:start + BATCH_CHUNK_SIZE]
+            chunk_ids = grant_ids[start:start + BATCH_CHUNK_SIZE]
+            batch = client.messages.batches.create(requests=chunk)
+            print(f"Batch {len(batches_metadata) + 1}: {batch.id} ({len(chunk)} requests, status: {batch.processing_status})")
+            batches_metadata.append({
+                "batch_id": batch.id,
+                "n_records": len(chunk),
+                "dataset_ids": chunk_ids,
+            })
+
+        batch_ids = [b["batch_id"] for b in batches_metadata]
 
         metadata = {
-            "batch_id": batch_id,
             "run_table": RUN_TABLE,
             "dedup_table": DEDUP_TABLE,
             "model": LLM_MODEL_SCOPE,
             "n_records": len(data),
-            "dataset_ids": data["Grant ID"].tolist(),
+            "batches": batches_metadata,
             "created_at": datetime.now().isoformat(),
         }
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         print(f"Batch metadata saved to {metadata_path}")
 
-    # 5. Poll until the batch has finished
-    print("\nWaiting for batch to complete")
+    # 5. Poll until all batches have finished
+    print(f"\nWaiting for {len(batch_ids)} batch(es) to complete")
 
-    while True:
-        batch = client.messages.batches.retrieve(batch_id)
-        print(f"Processing status: {batch.processing_status}   Counts: {batch.request_counts}")
-        if batch.processing_status == "ended":
-            break
-        time.sleep(POLL_INTERVAL_SECONDS)
+    pending = set(batch_ids)
+    while pending:
+        for batch_id in list(pending):
+            batch = client.messages.batches.retrieve(batch_id)
+            print(f"Batch {batch_id}: {batch.processing_status}   Counts: {batch.request_counts}")
+            if batch.processing_status == "ended":
+                pending.discard(batch_id)
+        if pending:
+            time.sleep(POLL_INTERVAL_SECONDS)
 
-    # 6. Retrieve and parse results
+    # 6. Retrieve and parse results from every batch
     print("\nRetrieving results")
 
     raw_results = []
-    for result in client.messages.batches.results(batch_id):
-        grant_id = result.custom_id.replace("_", ".")
-        if result.result.type == "succeeded":
-            content = result.result.message.content
-            stop_reason = result.result.message.stop_reason
-            tool_block = next((b for b in content if b.type == "tool_use"), None)
-            if tool_block:
-                record = dict(tool_block.input)
-                record["Grant ID"] = grant_id
-                record["status_LLM"] = "ok"
-                record["stop_reason_LLM"] = stop_reason
+    for batch_id in batch_ids:
+        for result in client.messages.batches.results(batch_id):
+            grant_id = result.custom_id.replace("_", ".")
+            if result.result.type == "succeeded":
+                content = result.result.message.content
+                stop_reason = result.result.message.stop_reason
+                tool_block = next((b for b in content if b.type == "tool_use"), None)
+                if tool_block:
+                    record = dict(tool_block.input)
+                    record["Grant ID"] = grant_id
+                    record["status_LLM"] = "ok"
+                    record["stop_reason_LLM"] = stop_reason
+                else:
+                    record = {"Grant ID": grant_id, "status_LLM": "parse_error", "stop_reason_LLM": stop_reason}
             else:
-                record = {"Grant ID": grant_id, "status_LLM": "parse_error", "stop_reason_LLM": stop_reason}
-        else:
-            record = {"Grant ID": grant_id, "status_LLM": result.result.type, "stop_reason_LLM": None}
-        raw_results.append(record)
+                record = {"Grant ID": grant_id, "status_LLM": result.result.type, "stop_reason_LLM": None}
+            raw_results.append(record)
 
     results_df = pd.DataFrame(raw_results)
     non_llm_cols = {"Grant ID", "status_LLM", "stop_reason_LLM"}

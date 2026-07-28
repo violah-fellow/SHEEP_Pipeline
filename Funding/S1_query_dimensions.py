@@ -65,7 +65,6 @@ def main(
     for i in search_strings:
         query_string = i.replace('\\"', '\"')
 
-        # only pull 100 grants per search term for testing
         # note: grants are filtered on start_year (not year, as for publications/patents) - using
         # the DSL's "field in [X:Y]" range syntax so a single-year search is just START_YEAR==END_YEAR
         # Funding fields: funding_currency is the grant's ORIGINAL currency code (metadata only -
@@ -75,19 +74,9 @@ def main(
         # native-currency amount for any grant whose funding_currency happens to match one of
         # them, falling back to just USD/EUR when it doesn't. funding_schemes is dropped - it
         # isn't a documented grants field.
-        query.append(dsl.query(f"""search grants in title_abstract_only for "{dsl_escape(query_string)}"
-                            where start_year in [{START_YEAR}:{END_YEAR}]
-                            return grants[id+title+original_title+abstract+start_date+start_year+end_date+
-                            funder_orgs+funder_org_name+funder_org_countries+funder_org_cities+
-                            funding_currency+funding_usd+funding_eur+funding_gbp+funding_aud+
-                            funding_cad+funding_chf+funding_jpy+funding_nzd+
-                            research_orgs+research_org_names+research_org_countries+research_org_cities+
-                            researchers+investigators+keywords+linkout+dimensions_url+
-                            category_for_2020+category_sdg]
-                            """))
-                            #limit 10"""))
 
-        # query.append(dsl.query_iterative(f"""search grants in title_abstract_only for "{dsl_escape(query_string)}"
+        # only pull 10 grants per search term for testing
+        # query.append(dsl.query(f"""search grants in title_abstract_only for "{dsl_escape(query_string)}"
         #                     where start_year in [{START_YEAR}:{END_YEAR}]
         #                     return grants[id+title+original_title+abstract+start_date+start_year+end_date+
         #                     funder_orgs+funder_org_name+funder_org_countries+funder_org_cities+
@@ -95,7 +84,18 @@ def main(
         #                     funding_cad+funding_chf+funding_jpy+funding_nzd+
         #                     research_orgs+research_org_names+research_org_countries+research_org_cities+
         #                     researchers+investigators+keywords+linkout+dimensions_url+
-        #                     category_for_2020+category_sdg]"""))
+        #                     category_for_2020+category_sdg]
+        #                     limit 10"""))
+
+        query.append(dsl.query_iterative(f"""search grants in title_abstract_only for "{dsl_escape(query_string)}"
+                            where start_year in [{START_YEAR}:{END_YEAR}]
+                            return grants[id+title+original_title+abstract+start_date+start_year+end_date+
+                            funder_orgs+funder_org_name+funder_org_countries+funder_org_cities+
+                            funding_currency+funding_usd+funding_eur+funding_gbp+funding_aud+
+                            funding_cad+funding_chf+funding_jpy+funding_nzd+
+                            research_orgs+research_org_names+research_org_countries+research_org_cities+
+                            researchers+investigators+keywords+linkout+dimensions_url+
+                            category_for_2020+category_sdg]"""))
 
     # Convert to pandas dataframe and deduplicate by id
     query_df = pd.concat([q.as_dataframe() for q in query], ignore_index=True)
