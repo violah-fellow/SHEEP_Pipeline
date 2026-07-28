@@ -36,6 +36,7 @@ def main(
     COMPANY_LIST=COMPANY_LIST,
     COMPANY_DATABASE=COMPANY_DATABASE,
 ):
+    import json
     import duckdb
     import numpy as np
     import pandas as pd
@@ -85,6 +86,19 @@ def main(
 
     db = duckdb.connect(database=DB_PATH)
     data = db.sql(f"SELECT * FROM {CLASSIFICATION_TABLE}").df()
+
+    # ASSIGNEE_COLUMN is stored on CLASSIFICATION_TABLE as a JSON-encoded string (see
+    # S2_ML_classification.py's _to_json), not a native list — parse it back so map_companies/
+    # match_company's list branch actually runs, instead of treating the whole JSON blob
+    # (brackets, quotes and all) as a single company name.
+    def _parse_json_list(x):
+        if not isinstance(x, str):
+            return x
+        try:
+            return json.loads(x)
+        except (TypeError, ValueError):
+            return x
+    data[ASSIGNEE_COLUMN] = data[ASSIGNEE_COLUMN].apply(_parse_json_list)
 
     company_list = pd.read_csv(COMPANY_LIST)
     company_database = pd.read_csv(COMPANY_DATABASE)

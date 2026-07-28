@@ -105,10 +105,10 @@ def main(
         if isinstance(x, str):
             return x
         if hasattr(x, '__len__'):
-            return _json.dumps(x.tolist() if hasattr(x, 'tolist') else list(x))
+            return _json.dumps(x.tolist() if hasattr(x, 'tolist') else list(x), ensure_ascii=False)
         if x is None or pd.isna(x):
             return x
-        return _json.dumps(x)
+        return _json.dumps(x, ensure_ascii=False)
 
     # 4. Known families: propagate pred_combined and pred_pillar from classification table
     if not known_data.empty:

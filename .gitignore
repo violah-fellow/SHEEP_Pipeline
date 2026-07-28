@@ -16,6 +16,9 @@ Patents/run_logs/*
 Patents/__pycache__/*
 Patents/patents.db
 Patents/patents.db.wal
+Patents/Clean_final_data.ipynb
+Patents/Data_analysis.rmd
+Patents/Data_analysis.ipynb
 
 Funding/batch_jobs/*
 Funding/status_logs/*

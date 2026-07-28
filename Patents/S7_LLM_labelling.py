@@ -544,13 +544,17 @@ def main(
         for label_type, cfg in LABEL_TYPES.items():
             labelled_data[cfg['output_column']] = candidates[primary_cols[label_type]]
 
-        # serialize nested Dimensions fields to JSON text (see S2_ML_classification.py for why)
+        # serialize nested Dimensions fields to JSON text (see S2_ML_classification.py for why).
+        # assignee_cities/assignee_countries arrive here already JSON-stringified by S2 — the
+        # isinstance(x, str) guard passes those through unchanged instead of double-encoding them.
         def _to_json(x):
+            if isinstance(x, str):
+                return x
             if x is None:
                 return None
             if isinstance(x, np.ndarray):
                 x = x.tolist()
-            return json.dumps(x, default=str)
+            return json.dumps(x, default=str, ensure_ascii=False)
 
         for col in NESTED_JSON_COLS:
             if col in labelled_data.columns:
