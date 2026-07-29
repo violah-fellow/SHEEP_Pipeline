@@ -73,6 +73,26 @@ CLASSIFICATION_TOOL = {
 }
 
 
+def _sanitize_tool_input(raw_input):
+    """Coerce a tool_use.input dict to the schema's declared types. The batch's tool_choice
+    forces a tool call but doesn't set strict:true, so Claude occasionally omits a required
+    field (most often cross_cutting) - the missing key ends up as NaN in a column that's
+    otherwise real True/False values, which DuckDB can't cast to BOOLEAN. Normalize anything
+    that doesn't match the expected type to None rather than letting it reach the database."""
+    clean = {}
+    for key, spec in _TOOL_PROPERTIES.items():
+        val = raw_input.get(key)
+        if spec["type"] == "boolean":
+            clean[key] = val if isinstance(val, bool) else None
+        elif spec["type"] == "string":
+            clean[key] = val if val in spec.get("enum", []) else None
+        elif spec["type"] == "integer":
+            clean[key] = val if isinstance(val, int) and not isinstance(val, bool) else None
+        else:
+            clean[key] = val
+    return clean
+
+
 def main(
     KEY_PATH=KEY_PATH,
     DB_PATH=DB_PATH,
@@ -119,9 +139,15 @@ def main(
         db.sql(f"CREATE TABLE {CLASSIFICATION_TABLE} AS SELECT * FROM {DEDUP_TABLE} LIMIT 0")
         print(f"Created empty '{CLASSIFICATION_TABLE}' with {DEDUP_TABLE}'s schema.")
     n_before = db.sql(f"SELECT COUNT(*) AS n FROM {CLASSIFICATION_TABLE}").df()['n'][0]
+    # Select CLASSIFICATION_TABLE's own columns by name rather than 'SELECT *' - if a prior
+    # run's write-back (step 7) crashed partway through, DEDUP_TABLE can already have the LLM
+    # columns added while CLASSIFICATION_TABLE doesn't yet, and a blind SELECT * would then
+    # supply the wrong number of columns for this INSERT.
+    class_cols = db.sql(f"SELECT * FROM {CLASSIFICATION_TABLE} LIMIT 0").df().columns.tolist()
+    col_list = ", ".join(f'"{c}"' for c in class_cols)
     db.sql(f"""
-        INSERT INTO {CLASSIFICATION_TABLE}
-        SELECT * FROM {DEDUP_TABLE}
+        INSERT INTO {CLASSIFICATION_TABLE} ({col_list})
+        SELECT {col_list} FROM {DEDUP_TABLE}
         WHERE "Grant ID" NOT IN (SELECT "Grant ID" FROM {CLASSIFICATION_TABLE})
     """)
     n_after = db.sql(f"SELECT COUNT(*) AS n FROM {CLASSIFICATION_TABLE}").df()['n'][0]
@@ -221,9 +247,13 @@ def main(
                 stop_reason = result.result.message.stop_reason
                 tool_block = next((b for b in content if b.type == "tool_use"), None)
                 if tool_block:
-                    record = dict(tool_block.input)
+                    record = _sanitize_tool_input(dict(tool_block.input))
                     record["Grant ID"] = grant_id
-                    record["status_LLM"] = "ok"
+                    # A row with any missing/invalid field (see _sanitize_tool_input) is not
+                    # "ok" even though a tool call happened - status_LLM != 'ok' is what makes
+                    # S5's auto-accept masks fall through to manual review for it, regardless
+                    # of which specific field was incomplete.
+                    record["status_LLM"] = "ok" if all(v is not None for v in record.values()) else "incomplete_tool_call"
                     record["stop_reason_LLM"] = stop_reason
                 else:
                     record = {"Grant ID": grant_id, "status_LLM": "parse_error", "stop_reason_LLM": stop_reason}
