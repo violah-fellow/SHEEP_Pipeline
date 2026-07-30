@@ -19,10 +19,6 @@ RUN_TABLE = 'test_llm_scope'
 # table for final classifications
 CLASSIFICATION_TABLE = 'publications_classified'
 
-# ML threshold
-# path to the scope threshold used by S2_ML_classification
-THRESHOLD_PATH = 'Models/LR_scope_threshold.txt'
-
 # LLM
 # path to the system prompt used for scoping
 PROMPT_PATH = 'llm_prompts/scope_prompt_publications.md'
@@ -36,6 +32,12 @@ TEMPERATURE = 0.0
 BATCH_DIR = 'batch_jobs'
 # how often to check whether the batch has finished
 POLL_INTERVAL_SECONDS = 1800
+# The Message Batches API caps a single batch at 256MB and 100,000 requests. When a run has
+# enough in-scope publications to exceed either limit (e.g. a wide YEAR_FROM/YEAR_TO span), the
+# submission is split across multiple batches automatically. Kept comfortably under the hard
+# caps to leave headroom for the outer JSON structure and any estimation slack.
+MAX_BATCH_BYTES = 200 * 1024 * 1024
+MAX_BATCH_REQUESTS = 90000
 
 # START OF SCRIPT
 
@@ -74,13 +76,14 @@ def main(
     DB_PATH=DB_PATH,
     RUN_TABLE=RUN_TABLE,
     CLASSIFICATION_TABLE=CLASSIFICATION_TABLE,
-    THRESHOLD_PATH=THRESHOLD_PATH,
     PROMPT_PATH=PROMPT_PATH,
     LLM_MODEL_SCOPE=LLM_MODEL_SCOPE,
     MAX_TOKENS=MAX_TOKENS,
     TEMPERATURE=TEMPERATURE,
     BATCH_DIR=BATCH_DIR,
     POLL_INTERVAL_SECONDS=POLL_INTERVAL_SECONDS,
+    MAX_BATCH_BYTES=MAX_BATCH_BYTES,
+    MAX_BATCH_REQUESTS=MAX_BATCH_REQUESTS,
 ):
     import time
     import json
@@ -108,15 +111,18 @@ def main(
     if metadata_path.exists():
         # A batch for this run was already submitted; resume from its metadata instead of resubmitting.
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        batch_id = metadata["batch_id"]
-        print(f"Found existing batch for '{RUN_TABLE}': {batch_id}. Resuming without resubmitting.")
+        if "batches" not in metadata:
+            # backward compat with metadata written before multi-batch chunking existed
+            metadata["batches"] = [{
+                "batch_id": metadata["batch_id"],
+                "n_records": metadata.get("n_records"),
+                "dataset_ids": metadata.get("dataset_ids", []),
+            }]
+        batch_ids = [b["batch_id"] for b in metadata["batches"]]
+        print(f"Found existing batch(es) for '{RUN_TABLE}': {batch_ids}. Resuming without resubmitting.")
     else:
         data = db.sql(f"SELECT * FROM {RUN_TABLE}").df()
         print(f"{len(data)} rows loaded from '{RUN_TABLE}'")
-
-        with open(THRESHOLD_PATH, 'r') as f:
-            threshold = float(f.read().strip())
-        print(f"Scope threshold: {threshold:.3f}")
 
         data = data[data['pred_combined'] == 1].reset_index(drop=True)
         print(f"{len(data)} rows in scope, sending to LLM.")
@@ -153,53 +159,85 @@ def main(
 
         batch_requests = [build_batch_request(row) for _, row in data.iterrows()]
 
-        print("\nSubmitting batch")
-        batch = client.messages.batches.create(requests=batch_requests)
-        batch_id = batch.id
-        print(f"Batch ID: {batch_id}")
-        print(f"Status:   {batch.processing_status}")
+        # Split into multiple batches if needed: the Batches API caps a single submission at
+        # 256MB and 100,000 requests. Pack requests greedily by serialized size so each chunk
+        # stays under both limits.
+        def _chunk_requests(requests, max_bytes, max_count):
+            chunks, current, current_size = [], [], 0
+            for req in requests:
+                req_size = len(json.dumps(req).encode("utf-8"))
+                if req_size > max_bytes:
+                    print(f"Warning: request {req['custom_id']} is {req_size} bytes, "
+                          f"exceeding max_bytes ({max_bytes}) on its own; submitting it alone.")
+                if current and (current_size + req_size > max_bytes or len(current) >= max_count):
+                    chunks.append(current)
+                    current, current_size = [], 0
+                current.append(req)
+                current_size += req_size
+            if current:
+                chunks.append(current)
+            return chunks
 
+        request_chunks = _chunk_requests(batch_requests, MAX_BATCH_BYTES, MAX_BATCH_REQUESTS)
+        print(f"\nSubmitting {len(batch_requests)} requests across {len(request_chunks)} batch(es)")
+
+        batches_meta = []
+        for i, chunk in enumerate(request_chunks):
+            batch = client.messages.batches.create(requests=chunk)
+            print(f"Batch {i + 1}/{len(request_chunks)}: {batch.id} ({len(chunk)} requests), "
+                  f"status {batch.processing_status}")
+            batches_meta.append({
+                "batch_id": batch.id,
+                "n_records": len(chunk),
+                "dataset_ids": [r["custom_id"].replace("_", ".") for r in chunk],
+            })
+
+        batch_ids = [b["batch_id"] for b in batches_meta]
         metadata = {
-            "batch_id": batch_id,
             "run_table": RUN_TABLE,
             "model": LLM_MODEL_SCOPE,
             "n_records": len(data),
             "dataset_ids": data["id"].tolist(),
+            "batches": batches_meta,
             "created_at": datetime.now().isoformat(),
         }
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         print(f"Batch metadata saved to {metadata_path}")
 
-    # 4. Poll until the batch has finished
-    print("\nWaiting for batch to complete")
+    # 4. Poll until all batches have finished
+    print("\nWaiting for batch(es) to complete")
 
-    while True:
-        batch = client.messages.batches.retrieve(batch_id)
-        print(f"Processing status: {batch.processing_status}   Counts: {batch.request_counts}")
-        if batch.processing_status == "ended":
-            break
-        time.sleep(POLL_INTERVAL_SECONDS)
+    pending = set(batch_ids)
+    while pending:
+        for bid in list(pending):
+            batch = client.messages.batches.retrieve(bid)
+            print(f"Batch {bid}: {batch.processing_status}   Counts: {batch.request_counts}")
+            if batch.processing_status == "ended":
+                pending.discard(bid)
+        if pending:
+            time.sleep(POLL_INTERVAL_SECONDS)
 
-    # 5. Retrieve and parse results
+    # 5. Retrieve and parse results from every batch
     print("\nRetrieving results")
 
     raw_results = []
-    for result in client.messages.batches.results(batch_id):
-        pub_id = result.custom_id.replace("_", ".")
-        if result.result.type == "succeeded":
-            content = result.result.message.content
-            stop_reason = result.result.message.stop_reason
-            tool_block = next((b for b in content if b.type == "tool_use"), None)
-            if tool_block:
-                record = dict(tool_block.input)
-                record["id"] = pub_id
-                record["status_LLM"] = "ok"
-                record["stop_reason_LLM"] = stop_reason
+    for bid in batch_ids:
+        for result in client.messages.batches.results(bid):
+            pub_id = result.custom_id.replace("_", ".")
+            if result.result.type == "succeeded":
+                content = result.result.message.content
+                stop_reason = result.result.message.stop_reason
+                tool_block = next((b for b in content if b.type == "tool_use"), None)
+                if tool_block:
+                    record = dict(tool_block.input)
+                    record["id"] = pub_id
+                    record["status_LLM"] = "ok"
+                    record["stop_reason_LLM"] = stop_reason
+                else:
+                    record = {"id": pub_id, "status_LLM": "parse_error", "stop_reason_LLM": stop_reason}
             else:
-                record = {"id": pub_id, "status_LLM": "parse_error", "stop_reason_LLM": stop_reason}
-        else:
-            record = {"id": pub_id, "status_LLM": result.result.type, "stop_reason_LLM": None}
-        raw_results.append(record)
+                record = {"id": pub_id, "status_LLM": result.result.type, "stop_reason_LLM": None}
+            raw_results.append(record)
 
     results_df = pd.DataFrame(raw_results)
     non_llm_cols = {"id", "status_LLM", "stop_reason_LLM"}

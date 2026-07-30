@@ -131,6 +131,28 @@ def main(
     query_df['abstract'] = query_df['abstract'].str.replace(r'<[^>]*>', '', regex=True)
     query_df['date_dimensions'] = datetime.today().strftime('%y%m%d')
 
+    # Dimensions returns a different subset of fields per entry within these list-of-dict
+    # columns (e.g. some funders lack 'state_name'), which otherwise makes DuckDB's struct-type
+    # inference fail outright when creating the table. Fill every dict to the same key set.
+    def _normalize_struct_list_column(series):
+        all_keys = set()
+        for lst in series:
+            if isinstance(lst, list):
+                for d in lst:
+                    if isinstance(d, dict):
+                        all_keys.update(d.keys())
+        if not all_keys:
+            return series
+        def _fill(lst):
+            if not isinstance(lst, list):
+                return lst
+            return [{k: d.get(k) for k in all_keys} for d in lst if isinstance(d, dict)]
+        return series.apply(_fill)
+
+    for _c in ('assignee_cities', 'assignee_countries', 'funder_countries', 'funders'):
+        if _c in query_df.columns:
+            query_df[_c] = _normalize_struct_list_column(query_df[_c])
+
     # 3. Filter by CPC codes
     # Get CPC codes for filtering
     # Load CPC codes for filtering by reading the txt file
