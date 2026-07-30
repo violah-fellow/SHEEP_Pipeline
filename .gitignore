@@ -20,5 +20,16 @@ Patents/patents.db.wal
 Patents/Clean_final_data.ipynb
 Patents/Data_analysis.ipynb
 
+Funding/batch_jobs/*
+Funding/status_logs/*
+Funding/run_logs/*
+Funding/__pycache__/*
+Funding/funding.db
+Funding/funding.db.wal
+Funding/data_audit/*
+Funding/data_review/*
+Funding/data_output/*
+Funding/raw_data/*
+
 .env
 .claude/*
