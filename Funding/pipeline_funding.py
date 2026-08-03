@@ -12,10 +12,21 @@ from datetime import datetime
 from Helper_pipeline_functions import save_status, mark_done, find_incomplete_run
 from S1_query_dimensions import main as query_dimensions
 from S3_LLM_scope import main as scope_llm
-#from S6_LLM_labelling import main as label_research_category
+from S6_LLM_labelling import main as run_llm_labelling
 
 # CONFIG
 # edit parameters for this run here
+#
+# !! IMPORTANT - READ BEFORE CHANGING ANYTHING BELOW IF YOU'RE RESUMING A RUN !!
+# The values below are only used to build a fresh config when a run STARTS (i.e. right before
+# Step 1 first executes) - at that point they're snapshotted into status_logs/status_<RUN_TABLE>.json
+# and that saved copy, not this file, is what every later invocation of this script actually uses
+# (see find_incomplete_run()/RESUME below). So if a run is already partway through (Step 1 has
+# already run for it), editing e.g. LABEL_SCOPE or the RUN_* flags here does NOTHING for that
+# run - it'll silently keep using whatever was saved when it started (or, for a key added to this
+# file after that run started, the old cfg.get(..., <default>) fallback, which may not be what you
+# want). To actually change a setting for an in-progress run, edit its saved JSON in status_logs/
+# directly, or delete that file and accept that the whole run restarts from Step 1.
 
 # Resuming incomplete runs from status_log
 RESUME = True
@@ -34,9 +45,18 @@ END_YEAR     = 2025
 LLM_MODEL_SCOPE = 'claude-sonnet-4-6'   # or 'claude-haiku-4-5' for cheap test runs
 # path to the system prompt used for scoping
 PROMPT_PATH = 'llm_prompts/scope_prompt_funding.md'
-# model used for research-category labelling (S6) - PROMPT_PATHS/PILLAR_CATS/etc. are static,
-# not per-run, so they're left to S6's own defaults rather than parameterized here
+# model used for LLM labelling (S6: Research category, End product, Award purpose, Subpillar) -
+# PROMPT_PATHS/PILLAR_CATS/etc. are static, not per-run, so they're left to S6's own defaults
+# rather than parameterized here
 LLM_MODEL_LABEL = 'claude-sonnet-4-6'   # or 'claude-haiku-4-5' for cheap test runs
+# which of S6's 4 labelling stages Step 5 runs, and whether it relabels everything or only
+# new/missing labels - mirrors S6_LLM_labelling.py's own RUN_*/LABEL_SCOPE constants, exposed
+# here so they can be set per pipeline run without editing S6 directly
+RUN_RESCAT       = True
+RUN_ENDPRODUCT   = True
+RUN_AWARDPURPOSE = True
+RUN_SUBPILLAR    = True
+LABEL_SCOPE      = 'all'   # 'new_only' or 'all'
 
 # Classification table (pipeline-owned, accumulates across runs)
 CLASSIFICATION_TABLE = 'funding_classified'
@@ -88,6 +108,11 @@ else:
         'LLM_MODEL_SCOPE':       LLM_MODEL_SCOPE,
         'PROMPT_PATH':           PROMPT_PATH,
         'LLM_MODEL_LABEL':       LLM_MODEL_LABEL,
+        'RUN_RESCAT':            RUN_RESCAT,
+        'RUN_ENDPRODUCT':        RUN_ENDPRODUCT,
+        'RUN_AWARDPURPOSE':      RUN_AWARDPURPOSE,
+        'RUN_SUBPILLAR':         RUN_SUBPILLAR,
+        'LABEL_SCOPE':           LABEL_SCOPE,
         'CLASSIFICATION_TABLE':  CLASSIFICATION_TABLE,
     }
     status = {
@@ -183,14 +208,20 @@ if status['steps']['review'] != 'done':
 else:
     print("\nStep 4 (review) already done, skipping.")
 
-# Step 5: Research category labelling + promotion into funding_curated
+# Step 5: LLM labelling (Research category, End product, Award purpose, Subpillar) + promotion
+# of newly-labelled Dimensions grants into funding_curated
 if status['steps']['llm_labelling'] != 'done':
-    print("\nStarting Step 5: Research category labelling.")
-    label_research_category(
+    print("\nStarting Step 5: LLM labelling (Research category, End product, Award purpose, Subpillar).")
+    run_llm_labelling(
         KEY_PATH=cfg['KEY_PATH'],
         DB_PATH=cfg['DB_PATH'],
         CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
         LLM_MODEL_LABEL=cfg['LLM_MODEL_LABEL'],
+        RUN_RESCAT=cfg.get('RUN_RESCAT', True),
+        RUN_ENDPRODUCT=cfg.get('RUN_ENDPRODUCT', True),
+        RUN_AWARDPURPOSE=cfg.get('RUN_AWARDPURPOSE', True),
+        RUN_SUBPILLAR=cfg.get('RUN_SUBPILLAR', True),
+        LABEL_SCOPE=cfg.get('LABEL_SCOPE', 'new_only'),
     )
     mark_done(status, 'llm_labelling', STATUS_DIR)
 else:
