@@ -30,6 +30,44 @@ def normalize_title(val):
     return str(val).strip().lower()
 
 
+# funding_curated's target format for 'AP pillar' is the full pillar name (Plant-based/
+# Fermentation/Cultivated/Cross-cutting) - confirmed by S6_LLM_labelling.py's CODE_TO_AP_PILLAR,
+# which always produces these 4 exact strings when promoting a new Dimensions grant. The short
+# PB/F/CM/CC codes are internal-only (funding_classified's pillar_curated / the LLM tool schema),
+# never this column.
+CANONICAL_AP_PILLARS = {
+    'plant-based': 'Plant-based', 'fermentation': 'Fermentation',
+    'cultivated': 'Cultivated', 'cross-cutting': 'Cross-cutting',
+}
+
+
+def normalize_ap_pillar(val):
+    """Returns (normalized_value, resolved: bool). Unresolved rows keep their original value so
+    a human reviewing the export sees what actually needs deciding, not an empty cell.
+    Handles: casing variants of the 4 canonical pillars; a trailing end-product descriptor
+    leaked into the pillar field (e.g. 'Plant-based meat' -> 'Plant-based'); comma-joined
+    multi-pillar combos where every token is a canonical pillar (-> 'Cross-cutting', matching the
+    convention already used in S3_LLM_scope.py's derive_pillar for >1 true pillar flag).
+    Anything else (blank, 'Agnostic', an unrecognized token) is left unresolved."""
+    if is_empty(val):
+        return val, False
+
+    text = str(val).strip()
+    for suffix in (' meat', ' seafood'):
+        if text.lower().endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+
+    tokens = [t.strip().lower() for t in text.split(',') if t.strip()]
+    if not tokens or not all(t in CANONICAL_AP_PILLARS for t in tokens):
+        return val, False
+
+    distinct = {CANONICAL_AP_PILLARS[t] for t in tokens}
+    if len(distinct) == 1:
+        return next(iter(distinct)), True
+    return 'Cross-cutting', True
+
+
 def assign_stable_row_id(df, id_col):
     """Stamp a surrogate row ID from the row's position in the just-loaded raw file, as an
     explicit column (not the pandas index) - so it survives later reset_index/filtering.
@@ -201,3 +239,37 @@ def apply_reviewed_decisions(matches_df, reviewed_csv_path, id_cols, decision_co
     confirmed = working[working[decision_col] == True].drop(columns=['match_key', decision_col])
     rejected = working[working[decision_col] != True].drop(columns=['match_key', decision_col])
     return confirmed.reset_index(drop=True), rejected.reset_index(drop=True)
+
+
+def apply_reviewed_values(matches_df, reviewed_csv_path, id_cols, value_col):
+    """Read a human-edited copy of an export_for_review CSV back in, rejoin by match_key (not
+    row position), and return matches_df with value_col overwritten by the reviewed file's
+    values. Unlike apply_reviewed_decisions, this is for a free-text corrected-value column, not
+    a boolean confirm/reject - no coercion, no confirmed/rejected split. Raises if any match_key
+    present in matches_df is missing from the reviewed file, to guard against a stale or
+    mismatched reviewed file being applied against a different run. No-ops (no file read) when
+    matches_df is empty - export_for_review skipped writing one."""
+    if len(matches_df) == 0:
+        print("No candidate rows were exported for review - skipping reviewed-file read.")
+        return matches_df.copy()
+
+    reviewed = pd.read_csv(reviewed_csv_path)
+    if 'match_key' not in reviewed.columns:
+        raise ValueError(
+            f"'{reviewed_csv_path}' has no 'match_key' column - was it exported by export_for_review?"
+        )
+
+    working = matches_df.copy()
+    working['match_key'] = _build_match_key(working, id_cols)
+
+    missing = set(working['match_key']) - set(reviewed['match_key'])
+    if missing:
+        raise ValueError(
+            f"{len(missing)} match_key(s) in matches_df are missing from '{reviewed_csv_path}' - "
+            f"the reviewed file may be stale or from a different run. "
+            f"Missing keys (first 5): {sorted(missing)[:5]}"
+        )
+
+    values = reviewed.set_index('match_key')[value_col]
+    working[value_col] = working['match_key'].map(values)
+    return working.drop(columns=['match_key']).reset_index(drop=True)

@@ -276,6 +276,11 @@ def _derive_end_product(tool_input, field_map, pillar):
     primary field and list their specific names in the secondary field, matching
     grant_endproduct_testing.ipynb's validated build_predictions logic."""
     true_cats = [orig for fname, orig in field_map.items() if tool_input.get(fname) is True]
+    # 'Agnostic' means "not aimed at a specific product" - combining it with a real product is
+    # contradictory, so drop it whenever at least one specific category is also true (mirrors
+    # _derive_research_category's identical 'Other' suppression above).
+    if 'Agnostic' in true_cats and len(true_cats) > 1:
+        true_cats = [c for c in true_cats if c != 'Agnostic']
     dairy_true = [c for c in true_cats if c in DAIRY_SUBCATS]
     non_dairy_true = [c for c in true_cats if c not in DAIRY_SUBCATS and c != 'Dairy']
     is_dairy = 'Dairy' in true_cats or bool(dairy_true)
@@ -581,6 +586,7 @@ def main(
     print("\nRetrieving results")
 
     date_labelling = datetime.today().strftime('%y%m%d')
+    all_failures = []  # every non-'ok' result across every stage/pool, for the end-of-run export
 
     for stage_name, stage in active_stages.items():
         if stage_name not in metadata['stages']:
@@ -596,7 +602,8 @@ def main(
             curated_df[col] = curated_df[col].astype(object)
 
         fc_results = []
-        n_curated_updates = 0
+        n_curated_total = 0
+        n_curated_ok = 0
 
         for result in client.messages.batches.results(batch_id):
             custom_id = result.custom_id
@@ -629,12 +636,26 @@ def main(
                 for col, val in zip(stage['classified_value_cols'], values):
                     row[col] = val
                 fc_results.append(row)
+                if status != "ok":
+                    all_failures.append({
+                        "pool": "A", "stage": stage_name, "grant_id": grant_id,
+                        "identification_code": None, "title": None, "curated_row_index": None,
+                        "status": status, "stop_reason": stop_reason,
+                    })
             elif custom_id.startswith("curated_"):
                 idx = int(custom_id[len("curated_"):])
+                n_curated_total += 1
                 if status == "ok":
                     for col, val in zip(stage['curated_value_cols'], values):
                         curated_df.at[idx, col] = val
-                    n_curated_updates += 1
+                    n_curated_ok += 1
+                else:
+                    all_failures.append({
+                        "pool": "B", "stage": stage_name, "grant_id": None,
+                        "identification_code": curated_df.at[idx, 'Identification code'],
+                        "title": curated_df.at[idx, 'Title'], "curated_row_index": idx,
+                        "status": status, "stop_reason": stop_reason,
+                    })
 
         fc_results_df = pd.DataFrame(fc_results, columns=[
             "Grant ID", *stage['classified_value_cols'], stage['classified_status_col'],
@@ -642,7 +663,7 @@ def main(
         ])
         n_ok = (fc_results_df[stage['classified_status_col']] == 'ok').sum() if len(fc_results_df) else 0
         print(f"[{stage_name}] Pool A results: {len(fc_results_df)} total, {n_ok} succeeded")
-        print(f"[{stage_name}] Pool B results: {n_curated_updates} rows updated")
+        print(f"[{stage_name}] Pool B results: {n_curated_total} total, {n_curated_ok} succeeded")
 
         if len(fc_results_df):
             llm_columns = {col: 'VARCHAR' for col in [
@@ -724,13 +745,28 @@ def main(
     db.sql(f"CREATE OR REPLACE TABLE {CURATED_TABLE} AS SELECT * FROM curated_df")
     print(f"'{CURATED_TABLE}' rewritten with {len(curated_df)} total rows.")
 
-    # 9. Excel copy of the final, updated funding_curated dataset (timestamp leading the
-    # filename, so reruns don't overwrite an earlier export)
+    # 9. Excel copy of the final, updated funding_curated dataset (RUN_LABEL leading the
+    # filename, so reruns don't overwrite an earlier export, and it's traceable to this run)
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(exist_ok=True)
-    export_path = output_dir / f"{datetime.today().strftime('%y%m%d_%H%M')}_{CURATED_TABLE}.xlsx"
+    export_path = output_dir / f"{RUN_LABEL}_{CURATED_TABLE}.xlsx"
     curated_df.to_excel(export_path, index=False)
     print(f"Excel copy of '{CURATED_TABLE}' saved to {export_path}")
+
+    # Combined failures export (both pools, every enabled stage) - so a failure can be found and
+    # directly fixed/retried without hunting through funding_classified/funding_curated by hand.
+    # Pool A failures will self-retry automatically on a future new_only run (status column is
+    # non-null but the row was never promoted); Pool B failures self-retry too, since the target
+    # curated_value_col was left blank on failure and build_pool_b's new_only check picks up any
+    # blank value regardless of cause - this export is for visibility/manual triage, not required
+    # for correctness.
+    if all_failures:
+        failures_df = pd.DataFrame(all_failures)
+        failures_path = output_dir / f"{RUN_LABEL}_labelling_failures.xlsx"
+        failures_df.to_excel(failures_path, index=False)
+        print(f"{len(failures_df)} failed labelling attempt(s) across all stages - saved to {failures_path}")
+    else:
+        print("No failed labelling attempts this run.")
 
     # Excel copy of this run's pre-relabelling snapshot, if one was taken (LABEL_SCOPE='all')
     snapshot_table = metadata.get('pre_relabel_snapshot_table')

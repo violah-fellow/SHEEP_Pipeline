@@ -222,6 +222,9 @@ if status['steps']['llm_labelling'] != 'done':
         RUN_AWARDPURPOSE=cfg.get('RUN_AWARDPURPOSE', True),
         RUN_SUBPILLAR=cfg.get('RUN_SUBPILLAR', True),
         LABEL_SCOPE=cfg.get('LABEL_SCOPE', 'new_only'),
+        # Tie S6's batch metadata/output filenames to this run's own timestamp rather than
+        # S6's own "now" default, so they're traceable to this run alongside its other outputs.
+        RUN_LABEL=cfg['RUN_TABLE'].replace('run_', 'labelling_'),
     )
     mark_done(status, 'llm_labelling', STATUS_DIR)
 else:
