@@ -7,7 +7,6 @@ import sys
 from datetime import datetime
 
 from Helper_pipeline_functions import save_status, mark_done, find_incomplete_run
-from S0_ML_training import main as train_classifiers
 from S1_query_dimensions import main as query_dimensions
 from S2_ML_classification import main as classify_run
 from S3_LLM_scope import main as scope_llm
@@ -28,18 +27,21 @@ KEY_PATH          = '../.env' # or '../../.env' if running from the pipeline fol
 
 # Query
 STRINGS_FILE = 'dimensions_search_publications.txt'
-YEAR_FROM    = 2023
-YEAR_TO      = 2024
+YEAR_FROM    = 2010
+YEAR_TO      = 2022
+
+# Classification
+EMBEDDINGS_TABLE     = 'publications_embeddings'
+CLASSIFICATION_TABLE = 'publications_classified'
 
 # GenAI
 LLM_MODEL_SCOPE = 'claude-sonnet-4-6'   # or 'claude-haiku-4-5' for cheap test runs
 # path to the system prompt used for scoping
 PROMPT_PATH = 'llm_prompts/scope_prompt_publications.md'
-
-# Training
-TRAINING_TABLE        = 'publications_new_training'
-EMBEDDINGS_PATH_TRAIN = 'embeddings/embeddings_new_training.npy'
-MAX_FN                = 0.01
+# directory for batch submission metadata, keyed by RUN_TABLE (allows resuming without resubmitting)
+BATCH_DIR = 'batch_jobs'
+# how often to check whether a batch has finished
+POLL_INTERVAL_SECONDS = 1800
 
 STATUS_DIR = 'status_logs'
 LOG_DIR    = 'run_logs'
@@ -89,19 +91,19 @@ else:
         'YEAR_TO':                YEAR_TO,
         'SCOPE_MODEL_PATH':       SCOPE_MODEL_PATH,
         'PILLAR_MODEL_PATH':      PILLAR_MODEL_PATH,
+        'EMBEDDINGS_TABLE':       EMBEDDINGS_TABLE,
+        'CLASSIFICATION_TABLE':   CLASSIFICATION_TABLE,
         'THRESHOLD_PATH':         THRESHOLD_PATH,
         'LLM_MODEL_SCOPE':        LLM_MODEL_SCOPE,
         'PROMPT_PATH':            PROMPT_PATH,
-        'MAX_FN':                 MAX_FN,
-        'TRAINING_TABLE':         TRAINING_TABLE,
-        'EMBEDDINGS_PATH_TRAIN':  EMBEDDINGS_PATH_TRAIN,
+        'BATCH_DIR':              BATCH_DIR,
+        'POLL_INTERVAL_SECONDS':  POLL_INTERVAL_SECONDS,
         'EMBEDDINGS_PATH_RUN':    EMBEDDINGS_PATH_RUN,
         'EMBEDDINGS_PATH_REVERSE': EMBEDDINGS_PATH_REVERSE,
     }
     status = {
         'config': cfg,
         'steps': {
-            'train':            'pending',
             'query':            'pending',
             'classify':         'pending',
             'llm_scope':         'pending',
@@ -116,23 +118,6 @@ else:
     sys.stdout = sys.stderr = _Tee(sys.__stdout__, _log_file)
     print(f"Starting new run '{cfg['RUN_TABLE']}'")
 
-
-# Step 0: Train classifiers
-if status['steps']['train'] != 'done':
-    print("\nStarting Step 0: Train classifiers.")
-    # train_classifiers(
-    #     DB_PATH=cfg['DB_PATH'],
-    #     TRAINING_TABLE=cfg['TRAINING_TABLE'],
-    #     EMBEDDINGS_PATH=cfg['EMBEDDINGS_PATH_TRAIN'],
-    #     SCOPE_MODEL_PATH=cfg['SCOPE_MODEL_PATH'],
-    #     PILLAR_MODEL_PATH=cfg['PILLAR_MODEL_PATH'],
-    #     THRESHOLD_PATH=cfg['THRESHOLD_PATH'],
-    #     MAX_FN=cfg['MAX_FN],
-    # )
-    mark_done(status, 'train', STATUS_DIR)
-else:
-    print("\nStep 0 (train) already done, skipping.")
-
 # Step 1: Query Dimensions
 if status['steps']['query'] != 'done':
     print("\nStarting Step 1: Query Dimensions for publications.")
@@ -140,6 +125,7 @@ if status['steps']['query'] != 'done':
         KEY_PATH=cfg['KEY_PATH'],
         DB_PATH=cfg['DB_PATH'],
         RUN_TABLE=cfg['RUN_TABLE'],
+        CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
         STRINGS_FILE=cfg['STRINGS_FILE'],
         YEAR_FROM=cfg['YEAR_FROM'],
         YEAR_TO=cfg['YEAR_TO'],
@@ -158,6 +144,8 @@ if status['steps']['classify'] != 'done':
         SCOPE_MODEL_PATH=cfg['SCOPE_MODEL_PATH'],
         PILLAR_MODEL_PATH=cfg['PILLAR_MODEL_PATH'],
         THRESHOLD_PATH=cfg['THRESHOLD_PATH'],
+        EMBEDDINGS_TABLE=cfg['EMBEDDINGS_TABLE'],
+        CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
     )
     mark_done(status, 'classify', STATUS_DIR)
 else:
@@ -170,9 +158,11 @@ if status['steps']['llm_scope'] != 'done':
         KEY_PATH=cfg['KEY_PATH'],
         DB_PATH=cfg['DB_PATH'],
         RUN_TABLE=cfg['RUN_TABLE'],
-        THRESHOLD_PATH=cfg['THRESHOLD_PATH'],
+        CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
         LLM_MODEL_SCOPE=cfg['LLM_MODEL_SCOPE'],
         PROMPT_PATH=cfg['PROMPT_PATH'],
+        BATCH_DIR=cfg['BATCH_DIR'],
+        POLL_INTERVAL_SECONDS=cfg['POLL_INTERVAL_SECONDS'],
     )
     mark_done(status, 'llm_scope', STATUS_DIR)
 else:
@@ -185,6 +175,7 @@ if status['steps']['reverse_query'] != 'done':
         KEY_PATH=cfg['KEY_PATH'],
         DB_PATH=cfg['DB_PATH'],
         RUN_TABLE=cfg['RUN_TABLE'],
+        CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
         REVERSE_TABLE=cfg['REVERSE_TABLE'],
         YEAR_FROM=cfg['YEAR_FROM'],
         YEAR_TO=cfg['YEAR_TO'],
@@ -202,6 +193,8 @@ if status['steps']['reverse_classify'] != 'done':
         EMBEDDINGS_PATH=cfg['EMBEDDINGS_PATH_REVERSE'],
         SCOPE_MODEL_PATH=cfg['SCOPE_MODEL_PATH'],
         PILLAR_MODEL_PATH=cfg['PILLAR_MODEL_PATH'],
+        EMBEDDINGS_TABLE=cfg['EMBEDDINGS_TABLE'],
+        CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
         THRESHOLD_PATH=cfg['THRESHOLD_PATH'],
     )
     mark_done(status, 'reverse_classify', STATUS_DIR)
@@ -215,8 +208,11 @@ if status['steps']['reverse_llm_scope'] != 'done':
         KEY_PATH=cfg['KEY_PATH'],
         DB_PATH=cfg['DB_PATH'],
         RUN_TABLE=cfg['REVERSE_TABLE'],
-        THRESHOLD_PATH=cfg['THRESHOLD_PATH'],
+        CLASSIFICATION_TABLE=cfg['CLASSIFICATION_TABLE'],
         LLM_MODEL_SCOPE=cfg['LLM_MODEL_SCOPE'],
+        PROMPT_PATH=cfg['PROMPT_PATH'],
+        BATCH_DIR=cfg['BATCH_DIR'],
+        POLL_INTERVAL_SECONDS=cfg['POLL_INTERVAL_SECONDS'],
     )
     mark_done(status, 'reverse_llm_scope', STATUS_DIR)
 else:

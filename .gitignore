@@ -7,6 +7,7 @@ Publications/run_logs/*
 Publications/__pycache__/*
 Publications/publications.db
 Publications/publications.db.wal
+Publications/Data_analysis.ipynb
 
 Patents/data/*
 Patents/embeddings/*
@@ -17,7 +18,6 @@ Patents/__pycache__/*
 Patents/patents.db
 Patents/patents.db.wal
 Patents/Clean_final_data.ipynb
-Patents/Data_analysis.rmd
 Patents/Data_analysis.ipynb
 
 Funding/batch_jobs/*

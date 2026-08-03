@@ -118,12 +118,17 @@ def main(
 
     # Convert to pandas dataframe and deduplicate by id
     query_df = query.as_dataframe()
+    print(f"\n{len(query_df)} publications retrieved from dimensions.")
+
+    # Deduplicate
     query_df = query_df.drop_duplicates(subset="id").reset_index(drop=True)
     query_df['date_dimensions'] = datetime.today().strftime('%y%m%d')
 
     # 3. Filter articles
     # Filter for articles
     query_df = query_df[query_df['type'] == 'article']
+
+    print(f"\n{len(query_df)} publications remain after deduplication and filtering for articles.")
 
     # Filter publications that already are in the final database
     # Connect to SQL database
