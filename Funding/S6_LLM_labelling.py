@@ -392,6 +392,10 @@ def main(
     import pandas as pd
     from dotenv import load_dotenv
 
+    from Funding_dedup_helpers import (
+        derive_duration_and_years_active, normalize_country_name, clean_pi_country_cell, derive_region,
+    )
+
     run_flags = {
         'rescat': RUN_RESCAT, 'end_product': RUN_ENDPRODUCT,
         'award_purpose': RUN_AWARDPURPOSE, 'subpillar': RUN_SUBPILLAR,
@@ -702,6 +706,22 @@ def main(
             new_rows = []
             for _, row in to_promote.iterrows():
                 new_row = {lrd_col: row.get(src_col) for src_col, lrd_col in PROMOTE_COL_MAP.items()}
+                new_row['PI organisation country'] = clean_pi_country_cell(new_row.get('PI organisation country'))
+                new_row['Funder Country'] = normalize_country_name(new_row.get('Funder Country'))
+                new_row['Funder region'] = derive_region(new_row.get('Funder Country'), delimiter=',')
+                new_row['PI organisation region'] = derive_region(new_row.get('PI organisation country'), delimiter=';')
+
+                # Dimensions has no separate "government contribution" concept - the total amount
+                # already *is* the gov contribution for these grants, unlike Grants-Tracker-style
+                # sources (which can be part-government, part-other funding). Copy straight across
+                # rather than leaving these blank forever.
+                new_row['Gov contribution']            = new_row.get('Total amount')
+                new_row['Gov contribution (USD)']      = new_row.get('Total amount (USD)')
+                new_row['Gov & NP contribution (EUR)'] = new_row.get('Total amount (EUR)')
+
+                _duration, _years_active = derive_duration_and_years_active(row.get('Start Year'), row.get('End Year'))
+                new_row['duration (years)'] = _duration
+                new_row['Years active'] = _years_active
 
                 names_first, names_rest = _split_first_rest(row.get('Researchers'))
                 if names_first:

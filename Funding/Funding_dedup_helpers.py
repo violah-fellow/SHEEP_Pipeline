@@ -3,15 +3,151 @@
 ## prototype: gap-filling, highlighted-diff audit exports, and the export-for-review /
 ## apply-reviewed-decisions round trip used at each of the 4 manual title-match review points.
 
+import re
 from pathlib import Path
 
 import pandas as pd
-
+import pycountry
 
 def is_empty(val):
     if pd.isna(val):  # check for NaN / None / pd.NA
         return True
     return str(val).strip() == ''  # also treat blank strings as empty
+
+
+# Abbreviations/typos/alternate names seen across raw sources that should read as one canonical
+# name everywhere - keyed lowercase for case-insensitive lookup.
+COUNTRY_ALIASES = {
+    'usa': 'United States', 'u.s.a.': 'United States', 'u.s.': 'United States',
+    'uk': 'United Kingdom',
+    'czech republic': 'Czechia',  # both seen in the raw data - Czechia is the more common form here
+    'finalnd': 'Finland',  # typo seen in raw Dimensions PI-organisation data
+}
+
+# Region for every country name this pipeline is likely to see, grouped into the 8 categories
+# GFI's reporting uses (Africa / Asia-Asia Pacific / Europe / North America / South America /
+# Oceania / Middle East / Global). Built from standard geography, cross-checked against every
+# already-correctly-labeled row in funding_curated at the time this was written, matching this
+# dataset's own established conventions where they diverge from strict geography: Russia and
+# Turkey -> Europe (every existing row already does this - both have deep Council of
+# Europe/OECD-Europe ties); Australia/New Zealand/Pacific nations -> 'Asia/Asia Pacific' rather
+# than 'Oceania' (every existing Australia row already does this; 'Oceania' was only used
+# inconsistently twice). 'EU' and 'Global' are the two pseudo-country values already used in
+# 'Funder Country' - not real countries, but need a region each all the same.
+_EUROPE = [
+    'Austria', 'Belgium', 'Bulgaria', 'Croatia', 'Cyprus', 'Czechia', 'Denmark', 'Estonia',
+    'Finland', 'France', 'Germany', 'Greece', 'Hungary', 'Iceland', 'Ireland', 'Italy', 'Latvia',
+    'Liechtenstein', 'Lithuania', 'Luxembourg', 'Malta', 'Moldova', 'Monaco', 'Montenegro',
+    'Netherlands', 'North Macedonia', 'Norway', 'Poland', 'Portugal', 'Romania', 'Russia',
+    'San Marino', 'Serbia', 'Slovakia', 'Slovenia', 'Spain', 'Sweden', 'Switzerland', 'Turkey',
+    'Ukraine', 'United Kingdom', 'Bosnia and Herzegovina', 'Albania', 'Belarus',
+]
+_NORTH_AMERICA = [
+    'United States', 'Canada', 'Mexico', 'Bermuda', 'Greenland',
+]
+_SOUTH_AMERICA = [
+    'Brazil', 'Argentina', 'Chile', 'Colombia', 'Peru', 'Uruguay', 'Paraguay', 'Bolivia',
+    'Ecuador', 'Venezuela', 'Guyana', 'Suriname', 'Costa Rica', 'Panama', 'Guatemala',
+    'Honduras', 'El Salvador', 'Nicaragua', 'Cuba', 'Dominican Republic', 'Jamaica',
+]
+_ASIA_PACIFIC = [
+    'China', 'Japan', 'South Korea', 'North Korea', 'India', 'Indonesia', 'Malaysia', 'Thailand',
+    'Vietnam', 'Nepal', 'Philippines', 'Singapore', 'Taiwan', 'Bangladesh', 'Sri Lanka',
+    'Pakistan', 'Afghanistan', 'Myanmar', 'Cambodia', 'Laos', 'Mongolia', 'Kazakhstan',
+    'Uzbekistan', 'Australia', 'New Zealand', 'Fiji', 'Papua New Guinea', 'Bhutan', 'Maldives',
+    'Brunei', 'Timor-Leste',
+]
+_MIDDLE_EAST = [
+    'Israel', 'Saudi Arabia', 'United Arab Emirates', 'Qatar', 'Kuwait', 'Bahrain', 'Oman',
+    'Jordan', 'Lebanon', 'Iraq', 'Iran', 'Syria', 'Yemen',
+]
+_AFRICA = [
+    'South Africa', 'Egypt', 'Nigeria', 'Kenya', 'Ghana', 'Morocco', 'Algeria', 'Tunisia',
+    'Libya', 'Ethiopia', 'Tanzania', 'Uganda', 'Rwanda', 'Senegal', 'Ivory Coast', 'Cameroon',
+    'Zimbabwe', 'Zambia', 'Botswana', 'Namibia', 'Mozambique', 'Djibouti',
+]
+
+COUNTRY_TO_REGION = {
+    **{c: 'Europe' for c in _EUROPE},
+    **{c: 'North America' for c in _NORTH_AMERICA},
+    **{c: 'South America' for c in _SOUTH_AMERICA},
+    **{c: 'Asia/Asia Pacific' for c in _ASIA_PACIFIC},
+    **{c: 'Middle East' for c in _MIDDLE_EAST},
+    **{c: 'Africa' for c in _AFRICA},
+    'EU': 'Europe',
+    'Global': 'Global',
+}
+
+
+def derive_region(country_val, delimiter):
+    """Derive a region value from a (possibly multi-value) country value - splits on `delimiter`,
+    maps each distinct token through COUNTRY_TO_REGION, deduplicates, and rejoins with ', '
+    (matching the multi-region format already used in funding_curated, e.g. 'Europe, North
+    America'). Returns None if country_val is blank or none of its tokens have a known region -
+    a real gap, not an error, since a handful of very small/rare countries aren't in the table."""
+    if is_empty(country_val):
+        return None
+    tokens = [t.strip() for t in str(country_val).split(delimiter) if t.strip()]
+    regions = []
+    for t in tokens:
+        region = COUNTRY_TO_REGION.get(t)
+        if region and region not in regions:
+            regions.append(region)
+    return ', '.join(regions) if regions else None
+
+
+# Every name/common-name pycountry recognizes, plus a few seen in the raw data that pycountry
+# doesn't carry under these exact names - used to distinguish a real country from junk (person
+# names, placeholders like 'TBD'/'Many'/'10 countries') in clean_pi_country_cell below.
+VALID_COUNTRY_NAMES = set()
+for _c in pycountry.countries:
+    VALID_COUNTRY_NAMES.add(_c.name.strip().lower())
+    if hasattr(_c, 'common_name'):
+        VALID_COUNTRY_NAMES.add(_c.common_name.strip().lower())
+VALID_COUNTRY_NAMES.update({'czech republic', 'russia', 'turkey', 'uk'})
+
+
+def clean_pi_country_cell(val):
+    """Clean a (possibly multi-value) PI-organisation-country cell: splits on both ';' and ','
+    (a handful of raw values pack a second country into what should be its own entry, e.g.
+    'Denmark, Sweden' appearing as a single semicolon-separated token - splitting on both
+    delimiters uniformly handles this with no special-casing needed, since normal entries never
+    contain a comma anyway), normalizes aliases/typos via COUNTRY_ALIASES, drops any token that
+    isn't a real country (catches junk seen in the raw data - person names, 'TBD', 'Many',
+    '10 countries'), deduplicates the remaining distinct tokens, and rejoins with '; '. Returns
+    None if nothing valid remains."""
+    if is_empty(val):
+        return val
+    seen = []
+    for tok in re.split(r'[;,]', str(val)):
+        tok = tok.strip()
+        if not tok:
+            continue
+        normalized = COUNTRY_ALIASES.get(tok.lower(), tok)
+        if normalized.strip().lower() not in VALID_COUNTRY_NAMES:
+            continue
+        if normalized not in seen:
+            seen.append(normalized)
+    return '; '.join(seen) if seen else None
+
+
+def normalize_country_name(val):
+    """Normalize every semicolon/comma-delimited token in val through COUNTRY_ALIASES (not just
+    the first) - needed for multi-country fields like 'Funder Country' ('Denmark, UK' etc.).
+    Tokens with no matching alias are returned unchanged, including their original spacing -
+    tokens that DO match keep their original leading/trailing whitespace too, so 'Denmark, UK'
+    becomes 'Denmark, United Kingdom', not 'Denmark,United Kingdom'."""
+    if is_empty(val):
+        return val
+    parts = re.split(r'([;,])', str(val))
+    for i in range(0, len(parts), 2):
+        token = parts[i]
+        alias = COUNTRY_ALIASES.get(token.strip().lower())
+        if alias:
+            leading = token[:len(token) - len(token.lstrip())]
+            trailing = token[len(token.rstrip()):]
+            parts[i] = leading + alias + trailing
+    return ''.join(parts)
 
 
 def is_zero(val):
@@ -66,6 +202,35 @@ def normalize_ap_pillar(val):
     if len(distinct) == 1:
         return next(iter(distinct)), True
     return 'Cross-cutting', True
+
+
+def extract_year(val):
+    """Extract just the calendar year from a messy end-date value - handles the Grants Tracker
+    raw export's mix of datetime objects, 'dd/mm/yyyy' strings, and ISO strings (verified: this
+    parses 1251/1251 of the real 'INT_End Date' column with dayfirst=True). Returns None on
+    NaT/blank rather than raising, so callers can apply it across a whole column safely."""
+    if is_empty(val):
+        return None
+    parsed = pd.to_datetime(val, dayfirst=True, errors='coerce')
+    if pd.isna(parsed):
+        return None
+    return parsed.year
+
+
+def derive_duration_and_years_active(start_year, end_year):
+    """(duration:int|None, years_active:str|None) from a grant's start/end year, using the
+    'inclusive calendar years spanned' convention already established in Funding2026_inscope.xlsx
+    (e.g. Aug 2022 - Aug 2024 counts as 3 years: 2022, 2023, 2024 - verified against 1507/1511
+    existing rows). Returns (None, None) if either year is missing or end_year < start_year (an
+    internal-consistency guard, not a plausibility bound - out-of-range years are otherwise
+    accepted as-is, by design)."""
+    if is_empty(start_year) or is_empty(end_year):
+        return None, None
+    start_year, end_year = int(start_year), int(end_year)
+    if end_year < start_year:
+        return None, None
+    years = list(range(start_year, end_year + 1))
+    return len(years), ', '.join(str(y) for y in years)
 
 
 def assign_stable_row_id(df, id_col):
