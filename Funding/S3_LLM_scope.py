@@ -37,7 +37,7 @@ BATCH_DIR = 'batch_jobs'
 # of JSON, since the system prompt and tool definition are repeated per request) is prone to
 # gateway/proxy timeouts, so large runs are split into chunks of this size and submitted as
 # separate batches
-BATCH_CHUNK_SIZE = 500
+BATCH_CHUNK_SIZE = 2000
 # how often to check whether the batch has finished
 POLL_INTERVAL_SECONDS = 600
 

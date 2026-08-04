@@ -439,7 +439,7 @@ def main(
     if RUN_LABEL is None:
         RUN_LABEL = find_incomplete_batch()
     if RUN_LABEL is None:
-        RUN_LABEL = f"labelling_{datetime.today().strftime('%y%m%d_%H%M')}"
+        RUN_LABEL = datetime.today().strftime('%y%m%d_%H%M')
 
     metadata_path = batch_dir / f"{RUN_LABEL}_llm_labelling.json"
     is_resuming = metadata_path.exists()
