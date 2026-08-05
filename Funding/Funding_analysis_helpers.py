@@ -7,6 +7,8 @@ import urllib.request
 
 import pandas as pd
 
+from Funding_dedup_helpers import COUNTRY_TO_REGION
+
 REQUEST_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
@@ -37,6 +39,44 @@ def split_multi_value(df, col, delimiter=';'):
 def weighted_sum(df, amount_col, weight_col='_weight'):
     """Sum amount_col x weight_col - the pattern every split_multi_value-based aggregation uses."""
     return (df[amount_col] * df[weight_col]).sum()
+
+
+# Country names match funding_curated's own naming (e.g. 'Czechia' not 'Czech Republic') - the
+# same names used throughout Funding_dedup_helpers.COUNTRY_TO_REGION.
+EU_27 = {
+    'Austria', 'Belgium', 'Bulgaria', 'Croatia', 'Cyprus', 'Czechia', 'Denmark', 'Estonia',
+    'Finland', 'France', 'Germany', 'Greece', 'Hungary', 'Ireland', 'Italy', 'Latvia',
+    'Lithuania', 'Luxembourg', 'Malta', 'Netherlands', 'Poland', 'Portugal', 'Romania',
+    'Slovakia', 'Slovenia', 'Spain', 'Sweden',
+}
+EU_PLUS = EU_27 | {'United Kingdom', 'Switzerland', 'Norway'}
+
+
+def europe_tier_split(df, country_col='Funder Country', delimiter=','):
+    """Explode country_col the same way as split_multi_value, then tag each exploded (grant,
+    country) row with every EU/EU+/Europe tier it belongs to - a country can match more than one
+    tier (EU subset of EU+ subset of Europe), by design: it's what lets EU/EU+/Europe totals be
+    compared side by side, each one inclusive of the narrower tiers nested inside it, rather than
+    a mutually-exclusive partition like the main 8-region breakdown."""
+    exploded = split_multi_value(df, country_col, delimiter=delimiter)
+    country_split_col = f'{country_col}_split'
+
+    def _tiers(country):
+        tiers = []
+        # The literal 'EU' Funder Country value (supranational EU-level funding, not attributed
+        # to one member state) counts toward the EU and EU+ totals too, not just Europe - it's
+        # EU money by definition, even though 'EU' itself isn't a member-state name in EU_27.
+        if country in EU_27 or country == 'EU':
+            tiers.append('EU')
+        if country in EU_PLUS or country == 'EU':
+            tiers.append('EU+')
+        if COUNTRY_TO_REGION.get(country) == 'Europe':
+            tiers.append('Europe')
+        return tiers
+
+    exploded['_tiers'] = exploded[country_split_col].apply(_tiers)
+    exploded = exploded[exploded['_tiers'].apply(len) > 0]
+    return exploded.explode('_tiers')
 
 
 def _fetch_json(url, timeout=15):
