@@ -160,6 +160,19 @@ def is_zero(val):
         return False
 
 
+def is_real_nonzero(val):
+    """Return True if val is a genuine, populated, nonzero number - the opposite of is_empty(val)
+    or is_zero(val) combined. Used by completeness checks that need to tell "a real amount is
+    here" apart from both blank and placeholder-0, without the caller having to combine the two
+    checks (and get the negation backwards) every time."""
+    if is_empty(val):
+        return False
+    try:
+        return float(val) != 0
+    except (ValueError, TypeError):
+        return False
+
+
 def normalize_title(val):
     if is_empty(val):
         return None
@@ -310,16 +323,40 @@ def gap_fill_researchers_and_orgs(
     return filled
 
 
+# Funding columns where gap_fill() treats an existing 0 as fillable (see its own funding_cols
+# param) - export_highlighted_diff needs the same list so it doesn't miss a 0-to-real-value change
+# that gap_fill() legitimately made. Covers every Total/Gov & NP variant (native/USD/EUR) used
+# across the pipeline's various merge paths, since each call site gap-fills a different subset.
+FUNDING_HIGHLIGHT_COLS = {
+    'Total amount', 'Total amount (USD)', 'Total amount (EUR)',
+    'Gov contribution', 'Gov contribution (USD)',
+    'Gov & NP contribution', 'Gov & NP contribution (USD)', 'Gov & NP contribution (EUR)',
+    'INT_Total amount (actual currency)', 'EXT_Total amount (USD)',
+    'INT_Gov contribution (actual currency)', 'EXT_Gov contribution (USD)',
+}
+
+
 def export_highlighted_diff(before_df, after_df, changed_indices, out_path):
     """Save an Excel audit trail: rows in changed_indices, cells that went from empty (in
-    before_df) to filled (in after_df) highlighted green. Returns the (unstyled) view."""
+    before_df) to filled (in after_df) highlighted green. Returns the (unstyled) view.
+    A funding column (FUNDING_HIGHLIGHT_COLS) going from a literal 0 to a real value also counts
+    as a highlighted change, matching gap_fill()'s own zero-is-fillable rule for those columns -
+    otherwise a real funding backfill (0 -> real amount) silently isn't highlighted, since 0 isn't
+    "empty" under the generic is_empty() check."""
     view = after_df.loc[sorted(changed_indices)]
 
     def _highlight(data):
         styles = pd.DataFrame('', index=data.index, columns=data.columns)
         for idx in data.index:
             for col in data.columns:
-                if is_empty(before_df.at[idx, col]) and not is_empty(data.at[idx, col]):
+                before_val = before_df.at[idx, col]
+                after_val = data.at[idx, col]
+                became_filled = is_empty(before_val) and not is_empty(after_val)
+                became_filled_from_zero = (
+                    col in FUNDING_HIGHLIGHT_COLS and is_zero(before_val)
+                    and not is_empty(after_val) and not is_zero(after_val)
+                )
+                if became_filled or became_filled_from_zero:
                     styles.at[idx, col] = 'background-color: #c6efce; color: #276221'
         return styles
 
@@ -386,6 +423,11 @@ def apply_reviewed_decisions(matches_df, reviewed_csv_path, id_cols, decision_co
         raise ValueError(
             f"'{reviewed_csv_path}' has no 'match_key' column - was it exported by export_for_review?"
         )
+    # match_key is always built as a string (see _build_match_key), but a purely-numeric id_cols
+    # (e.g. a single int column) round-trips through CSV as int64 by pandas' default type
+    # inference - cast back to string so the comparison/join below isn't silently comparing
+    # strings against ints (which would report every key as missing).
+    reviewed['match_key'] = reviewed['match_key'].astype(str)
 
     working = matches_df.copy()
     working['match_key'] = _build_match_key(working, id_cols)
@@ -423,6 +465,11 @@ def apply_reviewed_values(matches_df, reviewed_csv_path, id_cols, value_col):
         raise ValueError(
             f"'{reviewed_csv_path}' has no 'match_key' column - was it exported by export_for_review?"
         )
+    # match_key is always built as a string (see _build_match_key), but a purely-numeric id_cols
+    # (e.g. a single int column) round-trips through CSV as int64 by pandas' default type
+    # inference - cast back to string so the comparison/join below isn't silently comparing
+    # strings against ints (which would report every key as missing).
+    reviewed['match_key'] = reviewed['match_key'].astype(str)
 
     working = matches_df.copy()
     working['match_key'] = _build_match_key(working, id_cols)
@@ -438,3 +485,16 @@ def apply_reviewed_values(matches_df, reviewed_csv_path, id_cols, value_col):
     values = reviewed.set_index('match_key')[value_col]
     working[value_col] = working['match_key'].map(values)
     return working.drop(columns=['match_key']).reset_index(drop=True)
+
+
+def invalid_category_tokens(value, valid_categories, delimiter):
+    """Split value on delimiter and return whichever stripped tokens aren't in valid_categories -
+    empty list means every token matched. Generic on purpose (doesn't know about rescat/end_product/
+    award_purpose specifically) so callers pass in whatever category list/delimiter applies for
+    that stage - used to catch typos in freehand manual-review entries (e.g. 'Impact assessment'
+    vs the real 'Impact Assessments') before they get written into the data."""
+    if is_empty(value):
+        return []
+    tokens = [t.strip() for t in str(value).split(delimiter) if t.strip()]
+    valid_set = set(valid_categories)
+    return [t for t in tokens if t not in valid_set]

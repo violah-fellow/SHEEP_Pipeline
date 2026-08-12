@@ -44,6 +44,12 @@ RUN_SUBPILLAR    = True
 # anyway, since only promotion of a not-yet-promoted grant carries a label across).
 LABEL_SCOPE = 'new_only'
 
+# 'new_only' also auto-retries a row whose last attempt genuinely didn't finish (max_tokens) or
+# errored outright - but only up to this many times, so a persistently-failing row doesn't get
+# resubmitted forever. 1 = one retry beyond the original attempt (2 attempts total) before it's
+# left alone for manual review instead.
+MAX_RETRY_ATTEMPTS = 1
+
 # LLM
 # one system prompt per pillar for rescat and subpillar - each asks for an independent TRUE/FALSE
 # per category (subpillar's Cross-cutting pillar instead asks for a single choice - see
@@ -63,7 +69,11 @@ SUBPILLAR_PROMPT_PATHS = {
 }
 
 LLM_MODEL_LABEL = 'claude-sonnet-4-6'  # or 'claude-haiku-4-5' for cheap test runs
-MAX_TOKENS = 300
+# Was 300 - too tight for rescat's largest schema (16 boolean fields for Cross-cutting), which
+# caused a meaningful fraction of rescat calls to hit stop_reason='max_tokens' and get silently
+# truncated (see build_pool_a/build_pool_b's failure-retry check below, which specifically catches
+# this). 1024 comfortably covers every stage's tool-call JSON with headroom to spare.
+MAX_TOKENS = 1024
 TEMPERATURE = 0.0
 
 # Batch
@@ -180,6 +190,7 @@ STAGES = {
         'classified_value_cols': ['research_category_LLM'],
         'classified_status_col': 'category_status_LLM',
         'classified_stop_reason_col': 'category_stop_reason_LLM',
+        'classified_retry_count_col': 'category_retry_count_LLM',
         'curated_value_cols': ['Research category'],
         'promotes': True,
     },
@@ -195,6 +206,7 @@ STAGES = {
         'classified_value_cols': ['end_product_type_LLM', 'sub_end_product_LLM'],
         'classified_status_col': 'endproduct_status_LLM',
         'classified_stop_reason_col': 'endproduct_stop_reason_LLM',
+        'classified_retry_count_col': 'endproduct_retry_count_LLM',
         'curated_value_cols': ['End product type', 'sub-end product'],
         'promotes': False,
     },
@@ -210,6 +222,7 @@ STAGES = {
         'classified_value_cols': ['award_purpose_LLM'],
         'classified_status_col': 'awardpurpose_status_LLM',
         'classified_stop_reason_col': 'awardpurpose_stop_reason_LLM',
+        'classified_retry_count_col': 'awardpurpose_retry_count_LLM',
         'curated_value_cols': ['Award purpose'],
         'promotes': False,
     },
@@ -225,6 +238,7 @@ STAGES = {
         'classified_value_cols': ['subpillar_LLM'],
         'classified_status_col': 'subpillar_status_LLM',
         'classified_stop_reason_col': 'subpillar_stop_reason_LLM',
+        'classified_retry_count_col': 'subpillar_retry_count_LLM',
         'curated_value_cols': ['Sub-production pillar'],
         'promotes': False,
     },
@@ -370,6 +384,7 @@ def main(
     RUN_AWARDPURPOSE=RUN_AWARDPURPOSE,
     RUN_SUBPILLAR=RUN_SUBPILLAR,
     LABEL_SCOPE=LABEL_SCOPE,
+    MAX_RETRY_ATTEMPTS=MAX_RETRY_ATTEMPTS,
     PROMPT_PATHS=PROMPT_PATHS,
     PROMPT_PATH_ENDPRODUCT=PROMPT_PATH_ENDPRODUCT,
     PROMPT_PATH_AWARDPURPOSE=PROMPT_PATH_AWARDPURPOSE,
@@ -394,6 +409,7 @@ def main(
 
     from Funding_dedup_helpers import (
         derive_duration_and_years_active, normalize_country_name, clean_pi_country_cell, derive_region,
+        is_empty, export_for_review, apply_reviewed_values,
     )
 
     run_flags = {
@@ -477,15 +493,49 @@ def main(
     )
     already_promoted_ids = set(curated_df['Identification code'].dropna().astype(str))
 
+    # Grants deliberately removed via manual LLM-label review (e.g. "out of scope") - excluded
+    # from Pool A and promotion so one can never be re-promoted into funding_curated after being
+    # removed. S2_grant_deduplication.ipynb applies the same table to the Grants-Tracker/
+    # last-report rebuild path.
+    db.sql('''
+        CREATE TABLE IF NOT EXISTS manual_exclusions (
+            join_key VARCHAR PRIMARY KEY, reason VARCHAR, date_added VARCHAR
+        )
+    ''')
+    manually_excluded_ids = set(db.sql("SELECT join_key FROM manual_exclusions").df()['join_key'])
+
+    # Stop reasons that mean the LLM's attempt didn't actually finish for a reason a retry can fix
+    # - unlike a normal 'tool_use' completion that legitimately flagged nothing true (that's a
+    # real, final answer, not a failure), and unlike 'refusal' (the model declined to answer at
+    # all - almost always because the title/abstract touches something it's trained to decline on,
+    # e.g. a disease name - retrying the identical input will just get refused again, so this
+    # isn't auto-retried; it goes straight to manual review instead).
+    KNOWN_FAILURE_STOP_REASONS = ['max_tokens']
+
+    def _retry_eligible_mask(status, stop_reason, retry_count):
+        """Shared by both pools: retry if never attempted, or if the last attempt hit a
+        retry-worthy failure and hasn't already used up its retry budget."""
+        never_attempted = status.isna()
+        known_failure = (status == 'errored') | (stop_reason.isin(KNOWN_FAILURE_STOP_REASONS))
+        retries_left = retry_count.fillna(0) <= MAX_RETRY_ATTEMPTS
+        return never_attempted | (known_failure & retries_left)
+
     def build_pool_a(stage):
-        mask = (fc[SCOPE_COL] == 'in') & (~fc['Grant ID'].astype(str).isin(already_promoted_ids))
+        mask = (
+            (fc[SCOPE_COL] == 'in')
+            & (~fc['Grant ID'].astype(str).isin(already_promoted_ids))
+            & (~fc['Grant ID'].astype(str).isin(manually_excluded_ids))
+        )
         if stage['pillar_split']:
             mask &= fc[PILLAR_COL].isin(stage['valid_pillars'])
         status_col = stage['classified_status_col']
-        if status_col not in fc.columns:
-            fc[status_col] = None
+        stop_reason_col = stage['classified_stop_reason_col']
+        retry_count_col = stage['classified_retry_count_col']
+        for col in (status_col, stop_reason_col, retry_count_col):
+            if col not in fc.columns:
+                fc[col] = None
         if LABEL_SCOPE == 'new_only':
-            mask &= fc[status_col].isna()
+            mask &= _retry_eligible_mask(fc[status_col], fc[stop_reason_col], fc[retry_count_col])
         return fc[mask].reset_index(drop=True)
 
     def build_pool_b(stage):
@@ -493,11 +543,19 @@ def main(
         if stage['pillar_split']:
             mask &= curated_df['_ap_pillar_code'].isin(stage['valid_pillars'])
         value_col = stage['curated_value_cols'][0]
-        if value_col not in curated_df.columns:
-            curated_df[value_col] = None
+        # Reuses the same status/stop-reason/retry-count column names Pool A already has in
+        # funding_classified - Pool B never persisted these before, so historical Pool B rows
+        # have no failure history (see the one-off cleanup that reset specific rows to NULL to
+        # force a retry despite that gap); every row labelled from here on gets full visibility.
+        status_col = stage['classified_status_col']
+        stop_reason_col = stage['classified_stop_reason_col']
+        retry_count_col = stage['classified_retry_count_col']
+        for col in (value_col, status_col, stop_reason_col, retry_count_col):
+            if col not in curated_df.columns:
+                curated_df[col] = None
         if LABEL_SCOPE == 'new_only':
             missing = curated_df[value_col].isna() | (curated_df[value_col].astype(str).str.strip() == '')
-            mask &= missing
+            mask &= (missing | _retry_eligible_mask(curated_df[status_col], curated_df[stop_reason_col], curated_df[retry_count_col]))
         return curated_df[mask].index.tolist()
 
     def build_request(custom_id, tool, prompt_text, title, abstract):
@@ -602,8 +660,16 @@ def main(
         # force object dtype before writing string labels into curated_df - if a target column is
         # entirely null (e.g. never populated, or - as in a small test slice - coincidentally all
         # blank), DuckDB/pandas can infer a numeric dtype for it, which then rejects a string write
-        for col in stage['curated_value_cols']:
+        for col in [*stage['curated_value_cols'], stage['classified_status_col'],
+                    stage['classified_stop_reason_col'], stage['classified_retry_count_col']]:
+            if col not in curated_df.columns:
+                curated_df[col] = None
             curated_df[col] = curated_df[col].astype(object)
+
+        retry_count_col = stage['classified_retry_count_col']
+        if retry_count_col not in fc.columns:
+            fc[retry_count_col] = None
+        prior_retry_count_by_grant_id = fc.set_index('Grant ID')[retry_count_col].to_dict()
 
         fc_results = []
         n_curated_total = 0
@@ -631,10 +697,16 @@ def main(
 
             if custom_id.startswith("fc_"):
                 grant_id = custom_id[len("fc_"):].replace("_", ".")
+                # Incremented on every attempt (not just failures) - this is "how many times has
+                # this (grant, stage) actually been sent to the LLM", which build_pool_a/b compares
+                # against MAX_RETRY_ATTEMPTS to stop a persistently-failing row being resubmitted
+                # forever.
+                prior_count = prior_retry_count_by_grant_id.get(grant_id) or 0
                 row = {
                     "Grant ID": grant_id,
                     stage['classified_status_col']: status,
                     stage['classified_stop_reason_col']: stop_reason,
+                    retry_count_col: int(prior_count) + 1,
                     "date_labelling": date_labelling,
                 }
                 for col, val in zip(stage['classified_value_cols'], values):
@@ -649,6 +721,14 @@ def main(
             elif custom_id.startswith("curated_"):
                 idx = int(custom_id[len("curated_"):])
                 n_curated_total += 1
+                # Persisted unconditionally (unlike the value columns below, which only get set on
+                # success) so a future run's build_pool_b can tell a real failure apart from a
+                # legitimate "nothing applies" result - Pool B never tracked this before.
+                prior_count = curated_df.at[idx, retry_count_col]
+                prior_count = 0 if pd.isna(prior_count) else prior_count
+                curated_df.at[idx, stage['classified_status_col']] = status
+                curated_df.at[idx, stage['classified_stop_reason_col']] = stop_reason
+                curated_df.at[idx, retry_count_col] = int(prior_count) + 1
                 if status == "ok":
                     for col, val in zip(stage['curated_value_cols'], values):
                         curated_df.at[idx, col] = val
@@ -663,7 +743,7 @@ def main(
 
         fc_results_df = pd.DataFrame(fc_results, columns=[
             "Grant ID", *stage['classified_value_cols'], stage['classified_status_col'],
-            stage['classified_stop_reason_col'], "date_labelling",
+            stage['classified_stop_reason_col'], retry_count_col, "date_labelling",
         ])
         n_ok = (fc_results_df[stage['classified_status_col']] == 'ok').sum() if len(fc_results_df) else 0
         print(f"[{stage_name}] Pool A results: {len(fc_results_df)} total, {n_ok} succeeded")
@@ -674,6 +754,7 @@ def main(
                 *stage['classified_value_cols'], stage['classified_status_col'],
                 stage['classified_stop_reason_col'], 'date_labelling',
             ]}
+            llm_columns[retry_count_col] = 'INTEGER'
             for col, dtype in llm_columns.items():
                 db.sql(f'ALTER TABLE {CLASSIFICATION_TABLE} ADD COLUMN IF NOT EXISTS {col} {dtype}')
 
@@ -699,7 +780,8 @@ def main(
         # forever, since Pool A's new_only filter also excludes any row with a non-null status.
         to_promote = fc_full[
             (fc_full[rescat_stage['classified_status_col']].notna()) &
-            (~fc_full['Grant ID'].astype(str).isin(already_promoted_ids))
+            (~fc_full['Grant ID'].astype(str).isin(already_promoted_ids)) &
+            (~fc_full['Grant ID'].astype(str).isin(manually_excluded_ids))
         ]
 
         if len(to_promote):
@@ -711,13 +793,13 @@ def main(
                 new_row['Funder region'] = derive_region(new_row.get('Funder Country'), delimiter=',')
                 new_row['PI organisation region'] = derive_region(new_row.get('PI organisation country'), delimiter=';')
 
-                # Dimensions has no separate "government contribution" concept - the total amount
-                # already *is* the gov contribution for these grants, unlike Grants-Tracker-style
-                # sources (which can be part-government, part-other funding). Copy straight across
-                # rather than leaving these blank forever.
-                new_row['Gov contribution']            = new_row.get('Total amount')
-                new_row['Gov contribution (USD)']      = new_row.get('Total amount (USD)')
-                new_row['Gov & NP contribution (EUR)'] = new_row.get('Total amount (EUR)')
+                # Dimensions carries no funder-sector signal at all, so 'Funder type' starts blank
+                # for every newly-promoted grant - resolved later via the manual review in step 7b
+                # below (mirroring the Government/Nonprofit-only rule established for Grants-
+                # Tracker data in S2, rather than assuming every Dimensions grant is fully public/
+                # nonprofit-funded the way this used to unconditionally). Gov & NP stays blank
+                # here; step 7b copies Total across once a reviewed Funder type resolves to
+                # Government/Nonprofit.
 
                 _duration, _years_active = derive_duration_and_years_active(row.get('Start Year'), row.get('End Year'))
                 new_row['duration (years)'] = _duration
@@ -738,6 +820,10 @@ def main(
                 new_row['Database'] = 'Dimensions'
                 new_row['Identification code'] = row['Grant ID']
                 new_row['AP pillar'] = CODE_TO_AP_PILLAR.get(row.get(PILLAR_COL))
+                # Dimensions has no separate funding-decision concept - everything it indexes is a
+                # real, already-awarded grant, unlike Grants-Tracker-style sources which can be
+                # Committed/Unfunded/pending (same reasoning as the Gov & NP contribution copy above).
+                new_row['Funding decision'] = 'Awarded'
                 new_row['Research category'] = row.get('research_category_LLM')
 
                 # carry over any other enabled stage's already-computed labels for this grant, so a
@@ -758,6 +844,70 @@ def main(
     else:
         print("Rescat stage did not run this session - skipping promotion "
               "(any Pool A rows stay staged in funding_classified until a future run promotes them).")
+
+    # 7b. Dimensions Funder-type manual review - mirrors the Grants-Tracker mechanism in S2
+    # (gnp1a2b3c-gnp1a2b3f), but Dimensions carries no funder-sector signal at all (no separate
+    # raw gov-contribution figure, no org-type field) - every Dimensions-promoted row with a blank
+    # Funder type needs a human call, no automatic-derivation shortcut. Operates on curated_df
+    # directly (not a fresh DB query) so it naturally covers both this run's newly-promoted rows
+    # and anything left unresolved from a prior run's review in one pass. Unlike S2's within-one-
+    # session pause/resume, this review can span many separate S6 runs (Dimensions promotion is an
+    # ongoing background process, not a single interactive session) - so every run first checks
+    # every past export/REVIEWED.csv pair sitting in REVIEW_DIR for anything now resolved, applies
+    # those, then exports a fresh snapshot of whatever's still blank afterward. Idempotent either way.
+    REVIEW_DIR = Path('data_review')
+    REVIEW_DIR.mkdir(exist_ok=True)
+    GOV_NP_FUNDER_TYPES = {'Government', 'Nonprofit', 'Non-profit'}
+
+    n_reviews_applied = 0
+    for original_path in sorted(REVIEW_DIR.glob('*_dimensions_funder_type_for_review.csv')):
+        reviewed_path = Path(str(original_path).replace('.csv', '_REVIEWED.csv'))
+        if not reviewed_path.exists():
+            continue
+        original_export = pd.read_csv(original_path)
+        reviewed = apply_reviewed_values(
+            original_export, reviewed_path, id_cols=['Identification code'], value_col='Funder type',
+        )
+        newly_typed = reviewed[reviewed['Funder type'].astype(str).str.strip() != '']
+        if not len(newly_typed):
+            continue
+        newly_typed_map = newly_typed.set_index('Identification code')['Funder type']
+
+        update_mask = (
+            curated_df['Identification code'].isin(newly_typed_map.index)
+            & curated_df['Funder type'].apply(is_empty)
+        )
+        curated_df.loc[update_mask, 'Funder type'] = (
+            curated_df.loc[update_mask, 'Identification code'].map(newly_typed_map)
+        )
+
+        gov_np_mask = update_mask & curated_df['Funder type'].isin(GOV_NP_FUNDER_TYPES)
+        curated_df.loc[gov_np_mask, 'Gov & NP contribution'] = curated_df.loc[gov_np_mask, 'Total amount']
+        curated_df.loc[gov_np_mask, 'Gov & NP contribution (USD)'] = curated_df.loc[gov_np_mask, 'Total amount (USD)']
+        curated_df.loc[gov_np_mask, 'Gov & NP contribution (EUR)'] = curated_df.loc[gov_np_mask, 'Total amount (EUR)']
+        n_reviews_applied += int(update_mask.sum())
+        print(f"Applied '{reviewed_path.name}': filled Funder type for {int(update_mask.sum())} row(s); "
+              f"{int(gov_np_mask.sum())} of those are Government/Nonprofit and got Gov & NP copied from Total.")
+
+    dimensions_mask = curated_df['lrd_row_id'].isna() & curated_df['Funder type'].apply(is_empty)
+    needs_funder_type_review = curated_df[dimensions_mask].copy()
+    print(f"{len(needs_funder_type_review)} Dimensions-promoted row(s) still have no Funder type "
+          f"(after applying {n_reviews_applied} newly-reviewed value(s) above).")
+
+    if len(needs_funder_type_review):
+        needs_funder_type_review['Funder type'] = ''
+        export_for_review(
+            needs_funder_type_review[[
+                'Identification code', 'Title', 'Abstract', 'Total amount', 'Total amount (USD)',
+                'Total amount (EUR)', 'Currency', 'Funder name', 'Funder Country', 'Funder type',
+            ]],
+            id_cols=['Identification code'],
+            out_path=REVIEW_DIR / f'{RUN_LABEL}_dimensions_funder_type_for_review.csv',
+            decision_col='Funder type',
+            default='',
+        )
+        print(f"Exported for manual review to {REVIEW_DIR}/. Fill in 'Funder type', save as "
+              f"'..._REVIEWED.csv' in the same folder, then rerun S6 to apply.")
 
     # 8. Persist funding_curated once, atomically, with every stage's Pool B updates and any
     # newly-promoted rows

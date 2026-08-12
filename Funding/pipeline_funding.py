@@ -56,7 +56,7 @@ RUN_RESCAT       = True
 RUN_ENDPRODUCT   = True
 RUN_AWARDPURPOSE = True
 RUN_SUBPILLAR    = True
-LABEL_SCOPE      = 'all'   # 'new_only' or 'all'
+LABEL_SCOPE      = 'new_only'   # 'new_only' or 'all'
 
 # Classification table (pipeline-owned, accumulates across runs)
 CLASSIFICATION_TABLE = 'funding_classified'
@@ -230,4 +230,9 @@ if status['steps']['llm_labelling'] != 'done':
 else:
     print("\nStep 5 (llm_labelling) already done, skipping.")
 
-print(f"\nPipeline complete for run '{cfg['RUN_TABLE']}'.")
+print(f"\nPipeline complete for run '{cfg['RUN_TABLE']}'."
+      f"\n\n{'='*70}"
+      f"\nACTION REQUIRED: run S7_data_transformation.ipynb now."
+      f"\nfunding_curated is not finished until S7's currency backfill and QA"
+      f"\nchecks have been run - do not treat this run as done until you have."
+      f"\n{'='*70}")

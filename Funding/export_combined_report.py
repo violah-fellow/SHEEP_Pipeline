@@ -2,6 +2,7 @@
 ## country/year trend summaries, for a quick pre-meeting read on data coverage by country.
 ## Not part of the regular pipeline - safe to delete after use.
 
+import os
 from datetime import datetime
 
 import duckdb
@@ -9,6 +10,7 @@ import pandas as pd
 
 DB_PATH = 'funding.db'
 OUT_DIR = 'data_audit'
+os.makedirs(OUT_DIR, exist_ok=True)
 
 con = duckdb.connect(database=DB_PATH, read_only=True)
 data = con.sql('SELECT * FROM funding_curated').df()
