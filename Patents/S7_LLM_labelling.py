@@ -1,7 +1,30 @@
+## STEP 7 of the patents pipeline - the last step before the export (S8)
 ## LLM labelling script: sends in-scope, pillar-curated patents to Claude via the Batch API and
 ## stores research category, end product, ingredient, and fermentation subpillar labels in
 ## patents_labelled. Each label type is an independent sub-run with its own batch/metadata file,
 ## so a crash or slow batch on one type doesn't force resubmitting the others on the next run.
+##
+## What it does: while S3 only decided scope and pillar, this step assigns the detailed labels. There
+## are FOUR label types, each processed independently, one after another (see LABEL_TYPES below):
+##   category   - research category, with a different prompt and category list per pillar
+##   endproduct - end product / application area (meat, cheese, ...), one list for all pillars
+##   ingredient - ingredient type (isolates, emulsions, fats, ...), one list for all pillars
+##   subpillar  - biomass (BF) vs precision fermentation (PF); only Fermentation patents are sent to
+##                the LLM at all, every other pillar gets 'NA' written directly, without an API call
+##
+## As in S2/S3, labelling happens per family - one representative per (family_id, pillar_curated)
+## goes to the LLM and its labels are copied to the rest of the group.
+##
+## Prerequisite: the manual review (S6_Review_classifications.ipynb) must be finished, because this
+## step reads scope_curated / pillar_curated - the reviewed columns, not the LLM's own guess.
+##
+## Input:   patents_classified with curated scope and pillar, prompts in llm_prompts/
+## Output:  diagnostic *_LLM columns per label type in CLASSIFICATION_TABLE, plus LABELLED_TABLE -
+##          the clean final table that S8_Retrieve_dataset.ipynb exports
+##
+## Only patents for which ALL FOUR label types succeeded end up in LABELLED_TABLE. The rest are
+## simply picked up again on the next run - so running this script twice is safe and is the normal
+## way to retry failures.
 ## Can be run standalone (uses CONFIG defaults) or imported and called as main().
 
 import os
@@ -26,8 +49,11 @@ LABELLED_TABLE = 'patents_labelled'
 SCOPE_COL = 'scope_curated'
 PILLAR_COL = 'pillar_curated'
 
+# LLM
 LLM_MODEL_LABEL = 'claude-sonnet-4-6'  # or 'claude-haiku-4-5' for cheap test runs
+# the answer is only one or two category names, so a small limit is enough (S3 allows 512)
 MAX_TOKENS = 150
+# 0.0 = deterministic, as in S3
 TEMPERATURE = 0.0
 
 # Batch
@@ -42,6 +68,11 @@ POLL_INTERVAL_SECONDS = 600
 RUN_LABEL = None
 
 # Research categories allowed per pillar, used to build the category tool call's enum.
+# these lists ARE the allowed answers: the model can only return one of these strings (the enum in
+# the tool schema), and anything else is treated as a parse error. Prompt files and lists must be
+# kept consistent - a category that is only in the prompt cannot be returned, and vice versa.
+# Note the patent lists are slightly shorter than the publications ones (no "Consumer & market
+# research", no "Impact assessments") - those categories hardly occur in patents.
 PB_CATS = ["Crop development", "Strain development", "Ingredient optimisation", "End product formulation", "Texturization methods", "Food safety & quality", "Health & nutrition", "Other"]
 F_CATS  = ["Feedstocks", "Target molecule selection", "Strain development", "Bioprocess design", "Ingredient optimisation", "End product formulation", "Texturization methods", "Food safety & quality", "Health & nutrition", "Other"]
 CM_CATS = ["Cell line development", "Cell culture media", "Bioprocess design", "Scaffolding", "End product formulation", "Food safety & quality", "Health & nutrition", "Other"]
@@ -63,6 +94,21 @@ _UNGROUPED = '_all_'
 
 # One entry per label type. 'grouped_by_pillar' selects whether prompt_paths/categories are keyed
 # by pillar_curated (PB/F/CM/CC) or by the single _UNGROUPED key applied to every row.
+#
+# This dict is the control centre of the script: the code below is generic and derives everything
+# from these entries - which prompt is used, which values are allowed, what the columns are called
+# and whether the LLM is asked at all. Adding a new label type therefore means adding an entry here
+# (plus a prompt file), not writing new logic.
+# The fields, in order of importance:
+#   grouped_by_pillar          - one prompt per pillar (True) or one for all (False)
+#   prompt_paths / categories  - keyed by pillar, or by the _UNGROUPED sentinel
+#   output_column              - name of the column in the final LABELLED_TABLE
+#   diagnostic_prefix          - prefix of the working columns in CLASSIFICATION_TABLE
+#                                (primary_<prefix>_LLM, <prefix>_status_LLM, ...)
+#   tool_name / tool_description - what the forced tool call is called
+#   has_secondary              - whether a second-best category is requested (default True)
+#   restrict_to_pillars        - only these pillars are sent to the LLM ...
+#   auto_value_for_other_pillars - ... all others get this value written directly, without a request
 LABEL_TYPES = {
     'category': {
         'grouped_by_pillar': True,
@@ -165,9 +211,13 @@ def _build_category_tool(categories, tool_name, tool_description, has_secondary=
     }
 
 
+## _normalise_category
+## maps a category string returned by the model back onto the official spelling
 def _normalise_category(value, categories):
     # the LLM sometimes returns different casing (e.g. "Health & Nutrition") despite the enum
     # constraint; look up case-insensitively and treat anything else as unparseable
+    # anything not in the list becomes None, which makes the row a 'parse_error' - i.e. invented
+    # categories never reach the database
     if not isinstance(value, str):
         return None
     return {c.lower(): c for c in categories}.get(value.strip().lower())
@@ -315,14 +365,20 @@ def main(
                 data = db.sql(f"SELECT * FROM {CLASSIFICATION_TABLE}").df()
                 print(f"{len(data)} rows loaded from '{CLASSIFICATION_TABLE}'")
 
+                # the CURATED scope, not scope_LLM: only what a human confirmed (or what the review
+                # notebook accepted automatically) is labelled here
                 data = data[data[SCOPE_COL] == 'in'].reset_index(drop=True)
                 print(f"{len(data)} rows in scope (curated).")
 
+                # rows without a usable pillar are dropped - there is no category list for them.
+                # A high number here usually means the review left pillar_curated empty.
                 n_before = len(data)
                 data = data[data[PILLAR_COL].isin(RECOGNISED_PILLARS)].reset_index(drop=True)
                 if n_before - len(data) > 0:
                     print(f"{n_before - len(data)} rows dropped for missing/unrecognised '{PILLAR_COL}'.")
 
+                # anything already labelled successfully for THIS label type is skipped - which is
+                # what makes re-running the script a cheap retry of the failures only
                 if status_col in data.columns:
                     n_before = len(data)
                     data = data[data[status_col] != 'ok'].reset_index(drop=True)
@@ -372,6 +428,8 @@ def main(
             print(f"{len(reps)} representative patents selected from {len(data)} candidates "
                   f"for '{label_type}', sending to LLM.")
 
+            # prompt and tool schema are prepared once per group ('PB'/'F'/'CM'/'CC' for the
+            # category type, otherwise just the single _UNGROUPED entry) and reused for every request
             system_prompts = {}
             tools = {}
             for group, prompt_path in cfg['prompt_paths'].items():
@@ -508,10 +566,15 @@ def main(
             )
             print(f"'{CLASSIFICATION_TABLE}' updated with {label_type} columns for {n_written} rows.")
 
+        # marks this label type's batch as finished, so find_incomplete_batch() no longer offers it
+        # for resuming on the next call
         metadata['completed_at'] = datetime.now().isoformat()
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     # 7. Assemble LABELLED_TABLE: only rows successfully labelled by every label type get added.
+    # deliberately strict: a patent missing even one of the four labels is left out entirely, so the
+    # final table has no gaps. Those patents stay in CLASSIFICATION_TABLE and are retried on the next
+    # run - so a growing gap between the two tables is the signal to look at the *_status_LLM columns.
     print(f"\n{'=' * 60}\nAssembling '{LABELLED_TABLE}'\n{'=' * 60}")
 
     status_cols = {lt: f"{cfg['diagnostic_prefix']}_status_LLM" for lt, cfg in LABEL_TYPES.items()}
@@ -539,6 +602,10 @@ def main(
             print("\nDone!")
             return
 
+        # the final table keeps the patent metadata plus the curated columns, without the ML/LLM
+        # working columns; each label type contributes only its PRIMARY value, under the plain name
+        # from output_column (research_category, end_product, ingredient, subpillar). The secondary
+        # values stay in CLASSIFICATION_TABLE for QA and are not exported.
         dimensions_columns = [c for c in candidates.columns if c not in NON_METADATA_COLS]
         labelled_data = candidates[dimensions_columns].copy()
         for label_type, cfg in LABEL_TYPES.items():
@@ -573,5 +640,7 @@ def main(
     print("\nDone!")
 
 
+# only executed when the file is started directly (python S7_LLM_labelling.py) - this step is not
+# part of pipeline_patents.py and is started by hand after the review
 if __name__ == '__main__':
     main()

@@ -1,5 +1,21 @@
+## STEP 3 of the publications pipeline
 ## LLM scoping script: send ML-positive publications to Claude via the Batch API and store scope/pillar results.
 ## Submits a batch, waits (polling) for it to complete, then parses and writes results back to the database.
+##
+## What it does: the second filter stage. Every publication the ML step marked as possibly in scope
+## (pred_combined == 1) is sent to Claude with title and abstract, and Claude returns a scope
+## decision, a confidence score 1-7, and four pillar flags. Those results are NOT the final verdict:
+## S5_Review_classifications.ipynb decides from them which records are accepted automatically and
+## which ones a human has to look at.
+##
+## Input:   RUN_TABLE (with the ML predictions from S2) and the system prompt in PROMPT_PATH
+## Output:  the *_LLM columns in RUN_TABLE and CLASSIFICATION_TABLE
+##
+## Why the Batch API: batch requests cost about half as much as normal calls, at the price of taking
+## up to 24 hours. The script submits the batch, then polls until it is finished - it may therefore
+## run for a very long time. That is fine: everything it needs to resume is stored on disk
+## (batch_jobs/<RUN_TABLE>_llm_scope.json), so the script can be interrupted and restarted at any
+## time; it picks the batch up again instead of paying for a second submission.
 ## Can be run standalone (uses CONFIG defaults) or imported and called as main().
 
 import os
@@ -7,30 +23,48 @@ import os
 # CONFIG
 # edit parameters for this run here
 
+# NOTE: started through pipeline_publications.py, these are overridden by the pipeline's own CONFIG.
+
 # Anthropic API
 # path to API key
-KEY_PATH = '../../.env'
+# the .env file containing CLAUDE_API_KEY
+KEY_PATH = '../.env'
 
 # Database
 # path to DuckDB database
 DB_PATH = 'publications.db'
 # table containing the new input data to classify with run date as name
+# must already contain the ML columns from S2_ML_classification.py - the script filters on them
 RUN_TABLE = 'test_llm_scope'
 # table for final classifications
+# the LLM columns are written to both tables: to the run table (for this run) and to the
+# accumulating classification table (which is what the review notebook works on)
 CLASSIFICATION_TABLE = 'publications_classified'
 
 # LLM
 # path to the system prompt used for scoping
+# contains the actual scope definition - what counts as an alternative-protein publication. This is
+# the file to edit when the scope changes; the code itself contains no subject-matter rules.
 PROMPT_PATH = 'llm_prompts/scope_prompt_publications.md'
 # model to use for scoping; set from the main pipeline script
+# haiku is markedly cheaper and quicker, sonnet more accurate - use haiku for test runs and sonnet
+# for a real one (pipeline_publications.py sets sonnet)
 LLM_MODEL_SCOPE = 'claude-haiku-4-5'  # or 'claude-sonnet-4-6' for more accurate results
+# generous upper bound for the response; the answer is a single tool call, so far fewer tokens are
+# actually used - the value only caps runaway responses
 MAX_TOKENS = 512
+# 0.0 = as deterministic as possible: the same publication should get the same classification, and
+# this is a classification task, not a creative one
 TEMPERATURE = 0.0
 
 # Batch
 # directory for batch submission metadata, keyed by RUN_TABLE (allows resuming without resubmitting)
+# do not delete these json files while a batch is running - they are the only record of which batch
+# belongs to which run, and without them a restart resubmits everything (and pays for it again)
 BATCH_DIR = 'batch_jobs'
 # how often to check whether the batch has finished
+# 1800 s = 30 min. Batches usually take a few hours, so polling more often gains nothing; while
+# waiting, the script does nothing but sleep and can be interrupted safely.
 POLL_INTERVAL_SECONDS = 1800
 # The Message Batches API caps a single batch at 256MB and 100,000 requests. When a run has
 # enough in-scope publications to exceed either limit (e.g. a wide YEAR_FROM/YEAR_TO span), the
@@ -41,6 +75,12 @@ MAX_BATCH_REQUESTS = 90000
 
 # START OF SCRIPT
 
+# The tool definition below is how the LLM's answer is forced into a fixed shape: instead of free
+# text, Claude has to "call" this tool, and the tool's input_schema defines exactly which fields it
+# must return and which values are allowed (see tool_choice further down, which makes the call
+# mandatory). That is what makes the answers parseable without any text post-processing.
+# The four pillar flags are booleans rather than one pillar field on purpose - a publication can
+# cover several pillars, and pillar_LLM is derived from the combination of flags further below.
 _TOOL_PROPERTIES = {
     "scope": {
         "type": "string",
@@ -108,6 +148,9 @@ def main(
     # 2. Load and filter input data
     db = duckdb.connect(database=DB_PATH)
 
+    # the two branches below are the resume logic: if a metadata file for this run already exists,
+    # the batch has been submitted before and is only collected here. Only if there is none is data
+    # loaded, requests are built and a new batch is submitted (and paid for).
     if metadata_path.exists():
         # A batch for this run was already submitted; resume from its metadata instead of resubmitting.
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -124,6 +167,9 @@ def main(
         data = db.sql(f"SELECT * FROM {RUN_TABLE}").df()
         print(f"{len(data)} rows loaded from '{RUN_TABLE}'")
 
+        # only what the ML step let through - this is where the actual cost saving of the two-stage
+        # design comes from. Note the 1 (integer): in the run table pred_combined is 0/1, in
+        # CLASSIFICATION_TABLE it is 'in'/'out' (see S2_ML_classification.py).
         data = data[data['pred_combined'] == 1].reset_index(drop=True)
         print(f"{len(data)} rows in scope, sending to LLM.")
 
@@ -136,9 +182,13 @@ def main(
         with open(PROMPT_PATH, "r", encoding="utf-8") as f:
             system_prompt = f.read().strip()
 
+        # one request per publication. Only title and abstract are sent - no journal, no authors, no
+        # keywords: the decision should be based on content alone and not on where it was published.
         def build_batch_request(row):
             user_message = f"Title: {row['title']}\n\nAbstract: {row['abstract']}"
             return {
+                # custom_id is how a result is matched back to its publication later. Dots are not
+                # allowed in the id, so 'pub.123' is sent as 'pub_123' and converted back on parsing.
                 "custom_id": row["id"].replace(".", "_"),
                 "params": {
                     "model": LLM_MODEL_SCOPE,
@@ -148,11 +198,17 @@ def main(
                         {
                             "type": "text",
                             "text": system_prompt,
+                            # prompt caching: the long system prompt is identical in every request,
+                            # so it is only billed at full price once and read from the cache
+                            # afterwards. Clearly noticeable in the cost of a large batch.
                             "cache_control": {"type": "ephemeral"}
                         }
                     ],
                     "messages": [{"role": "user", "content": user_message}],
                     "tools": [CLASSIFICATION_TOOL],
+                    # forces the tool call: the model cannot answer in prose, it has to fill in the
+                    # schema. Note it does not force completeness - individual fields can still be
+                    # missing, which is what status_LLM is for.
                     "tool_choice": {"type": "tool", "name": "classify_publication"},
                 }
             }
@@ -205,6 +261,10 @@ def main(
         print(f"Batch metadata saved to {metadata_path}")
 
     # 4. Poll until all batches have finished
+    # from here on the script only waits. It may sit here for hours - that is normal, and it can be
+    # interrupted with Ctrl+C: on the next start it lands in the resume branch of step 2 and
+    # continues waiting for the same batch. 'ended' also covers batches that ended with errors;
+    # individual failed requests show up as status_LLM values other than 'ok' in step 5.
     print("\nWaiting for batch(es) to complete")
 
     pending = set(batch_ids)
@@ -220,9 +280,13 @@ def main(
     # 5. Retrieve and parse results from every batch
     print("\nRetrieving results")
 
+    # every result gets a status_LLM so problems stay visible in the data instead of being silently
+    # dropped: 'ok' = tool call parsed, 'parse_error' = answer without a tool call, anything else =
+    # the request itself failed (errored/expired/cancelled). The review notebook uses this column.
     raw_results = []
     for bid in batch_ids:
         for result in client.messages.batches.results(bid):
+            # undo the custom_id conversion from the submission step
             pub_id = result.custom_id.replace("_", ".")
             if result.result.type == "succeeded":
                 content = result.result.message.content
@@ -240,6 +304,8 @@ def main(
             raw_results.append(record)
 
     results_df = pd.DataFrame(raw_results)
+    # every field coming from the LLM gets a '_LLM' suffix, so it is always visible in the database
+    # which columns are model output and which are curated or Dimensions data
     non_llm_cols = {"id", "status_LLM", "stop_reason_LLM"}
     results_df = results_df.rename(columns={c: f"{c}_LLM" for c in results_df.columns if c not in non_llm_cols})
 
@@ -251,6 +317,11 @@ def main(
 
     # Derive pillar_LLM from the boolean flags (same logic as genai_scope_batchoutput.ipynb):
     # CC if multiple pillar flags are True, or if only cross_cutting_LLM is True
+    # i.e. the four booleans are collapsed into ONE pillar per publication, because that is what the
+    # dataset needs. Reading order: several pillars -> CC (cross-cutting), exactly one -> that one,
+    # none -> 'NA'. Patents and Funding use exactly the same rule - keep them in sync.
+    # Rows whose status_LLM is not 'ok' get None instead of a pillar, so a failed request is never
+    # mistaken for "no pillar found".
     pillar_flags = ["plant_based_LLM", "fermentation_LLM", "cultivated_LLM"]
 
     def derive_pillar(row):
@@ -276,8 +347,11 @@ def main(
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
     # 6. Write results back to RUN_TABLE
+    # (and to CLASSIFICATION_TABLE - the loop further down runs over both tables)
     print(f"\nUpdating '{RUN_TABLE}' with LLM columns.")
 
+    # the column types are stated explicitly because the columns are created via ALTER TABLE.
+    # confidence_LLM is DOUBLE rather than INTEGER so a missing value can be stored as NULL.
     llm_columns = {
         'scope_LLM':         'VARCHAR',
         'confidence_LLM':    'DOUBLE',
@@ -307,6 +381,8 @@ def main(
         if col in results_df.columns:
             results_df[col] = pd.array([_safe_bool(x) for x in results_df[col]], dtype='boolean')
 
+    # the same update is applied to both tables: the run table documents this run, the classification
+    # table is the one the review notebook (S5) and the labelling script (S6) read from
     for table in (RUN_TABLE, CLASSIFICATION_TABLE):
         existing_tables = db.sql("SHOW TABLES").df()['name'].tolist()
         if table not in existing_tables:
@@ -330,5 +406,6 @@ def main(
     print("\nDone!")
 
 
+# only executed when the file is started directly (python S3_LLM_scope.py)
 if __name__ == '__main__':
     main()
