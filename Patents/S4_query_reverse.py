@@ -1,4 +1,18 @@
+## STEP 4 of the patents pipeline
 ## Query script: query dimensions and store queried data in database
+## (reverse query - searching by patent family instead of by keyword)
+##
+## Idea behind this step: if one document of a family is in scope, its siblings in other countries
+## are too - they describe the same invention. So this step takes the family IDs of the in-scope
+## patents of this run and fetches every remaining family member from Dimensions.
+##
+## Important difference from the publications pipeline: these patents are NOT classified again.
+## They inherit the ML and LLM results of their family (step 5) and are written straight into
+## CLASSIFICATION_TABLE (step 6) - so no embedding, no API call, no cost. It also means the pipeline
+## ends after this step plus the assignee clean-up; nothing here needs S2 or S3 again.
+##
+## Input:   RUN_TABLE with the ML and LLM columns from S2/S3
+## Output:  REVERSE_TABLE ('<RUN_TABLE>_reverse') and the same rows appended to CLASSIFICATION_TABLE
 ## All parameters that need to be changed are defined in the CONFIG section below.
 
 import os
@@ -14,13 +28,17 @@ KEY_PATH = '../.env'
 # path to DuckDB database
 DB_PATH = 'patents.db'
 # table where run queries were stored
+# the classified run table of this run - family IDs are taken from its in-scope patents
 RUN_TABLE = 'run_test'
+# output table; the pipeline uses the same naming convention ('<run table>_reverse')
 REVERSE_TABLE = RUN_TABLE + '_reverse'
 # table for final classifications
 CLASSIFICATION_TABLE = 'patents_classified'
 
 # Queries
 # Other parameters for search
+# use the same year range as in S1_query_dimensions.py. Note this limits which family members are
+# found at all: siblings published outside the range stay invisible to the pipeline.
 YEAR_FROM = 2023
 YEAR_TO   = 2024
 # ...
@@ -28,7 +46,7 @@ YEAR_TO   = 2024
 # START OF SCRIPT
 
 def main(
-    KEY_PATH,
+    KEY_PATH=KEY_PATH,
     DB_PATH=DB_PATH,
     RUN_TABLE=RUN_TABLE,
     REVERSE_TABLE=REVERSE_TABLE,
@@ -47,6 +65,8 @@ def main(
 
     # 1. Load Dimensions API and search strings
     # Login to dimensions API requires a dsl.ini file stored on the computer
+    # NOTE: as in S1, that comment no longer matches the code - the key comes from the .env file at
+    # KEY_PATH. No search strings are read here either; this step searches by family ID.
     print("\nConnecting to the Dimensions API")
     
     load_dotenv(KEY_PATH) 
@@ -61,10 +81,13 @@ def main(
     run_data = db.sql(f"SELECT * FROM {RUN_TABLE}").df()
 
     # Filter for in scope patents and retrieve family ID's
+    # the ML decision (0/1 in the run table), not the curated one - the manual review only happens
+    # later, in S6. run_data is reused further down as the source of the inherited predictions.
     run_data = run_data[run_data['pred_combined'] == 1]
     family_ids = run_data['family_id'].dropna().astype(int).tolist()
 
-    # Function to batch family ID's    
+    # Function to batch family ID's
+    # helper that splits a long list into pieces of n items
     def chunks(list, n):
         for i in range(0, len(list), n):
             yield list[i:i + n]
@@ -85,6 +108,8 @@ def main(
     #     query.append(q)
 
     # full query
+    # in batches of 500 family IDs, because a single DSL query can only take a limited number of
+    # values; the field list must match S1_query_dimensions.py
     query = []
     for batch in chunks(family_ids, 500):
         q = dsl.query_iterative(f"""search patents
@@ -101,13 +126,17 @@ def main(
     print(f"\n{len(query_df)} patents retrieved from dimensions.")
 
     # deduplicate by id
+    # same two-stage deduplication as in S1: first identical documents, ...
     query_df = query_df.drop_duplicates(subset="id").reset_index(drop=True)
 
     # Remove version duplicates of the same patent
+    # ... then several versions of the same document in the same country - keep the newest and
+    # highest-value one per (family_id, jurisdiction, priority_year)
     query_df = query_df.sort_values(['publication_year', 'kind'], ascending=[False, False]).groupby(["family_id", "jurisdiction", "priority_year"]).head(1)
     print(f"\n{len(query_df)} patents remain after deduplication.")
 
     # clean abstract
+    # strip HTML tags that Dimensions returns inside patent abstracts
     query_df['abstract'] = query_df['abstract'].str.replace(r'<[^>]*>', '', regex=True)
     query_df['date_dimensions'] = datetime.today().strftime('%y%m%d')
 
@@ -134,6 +163,8 @@ def main(
             query_df[_c] = _normalize_struct_list_column(query_df[_c])
 
     # Filter publications that already are in the final database
+    # the crucial filter of this step: a family query returns above all the patents that are already
+    # in the dataset (that is where the family IDs came from). Only genuinely new siblings remain.
     existing_tables = db.sql("SHOW TABLES").df()['name'].tolist()
     if CLASSIFICATION_TABLE in existing_tables:
         existing_ids = db.sql(f"SELECT id FROM {CLASSIFICATION_TABLE}").df()['id']
@@ -182,6 +213,9 @@ def main(
     print(f"{len(query_df)} rows appended to {REVERSE_TABLE}.")
 
     # 5. Add scope and pillar information from patents of the same family
+    # the heart of this step: instead of classifying the new patents, they inherit ALL prediction
+    # columns - the ML ones and the LLM ones - from their already scored family sibling, joined on
+    # family_id. That is why this list is much longer than the corresponding one in S2.
     print(f"\nUpdating '{REVERSE_TABLE}' in database with prediction columns.")
 
     new_columns = {
@@ -207,6 +241,8 @@ def main(
         db.sql(f"ALTER TABLE {REVERSE_TABLE} ADD COLUMN IF NOT EXISTS {col} {dtype}")
 
     # make sure there is only one patent per family ID
+    # required for the join below - otherwise a family with several scored members would produce
+    # duplicate matches. Which member is kept does not matter: they all carry the same predictions.
     run_data = run_data.drop_duplicates(subset="family_id").reset_index(drop=True)
 
     available_cols = ['family_id'] + [c for c in new_columns.keys() if c in run_data.columns]
@@ -230,6 +266,7 @@ def main(
     data = db.sql(f"SELECT * FROM {REVERSE_TABLE}").df()
 
     # convert prediction in / out and add to CLASSIFICATION_TABLE
+    # 0/1 in the run tables, 'in'/'out' in CLASSIFICATION_TABLE - same convention as in S2
     data_classified = data.reindex(columns=output_columns).copy()
     data_classified['pred_combined'] = data_classified['pred_combined'].map({1: 'in', 0: 'out'})
     db.register('data_classified', data_classified)
@@ -239,11 +276,13 @@ def main(
     
     print(f"{len(data_classified)} rows appended to {CLASSIFICATION_TABLE}.")
 
-    # Close connection 
+    # Close connection
     db.close()
 
     print("Done!")
 
 
+# only executed when the file is started directly - note the KEY_PATH caveat in main() above:
+# main() without arguments raises a TypeError, use main(KEY_PATH='../.env')
 if __name__ == '__main__':
     main()

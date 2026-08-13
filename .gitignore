@@ -8,6 +8,7 @@ Publications/__pycache__/*
 Publications/publications.db
 Publications/publications.db.wal
 Publications/Data_analysis.ipynb
+Publications/Data_analysis_python.ipynb
 
 Patents/data/*
 Patents/embeddings/*

@@ -1,5 +1,23 @@
+## STEP 6 of the publications pipeline - the last step before the export (S7)
 ## LLM research-category labelling script: sends in-scope, pillar-curated publications to Claude
 ## via the Batch API and stores the resulting research_category in publications_labelled.
+##
+## What it does: while S3 only decided in/out of scope and pillar, this step assigns the detailed
+## research category (e.g. "Ingredient optimisation", "Bioprocess design"). The available categories
+## differ per pillar, so there is one system prompt and one tool schema per pillar - each publication
+## is asked with the category list of ITS pillar. Everything goes into a single batch nevertheless.
+##
+## Prerequisite: the manual review (S5_Review_classifications.ipynb) must be finished, because this
+## step reads scope_curated / pillar_curated - the reviewed columns, not the LLM's own guess.
+##
+## Input:   CLASSIFICATION_TABLE, rows with scope_curated == 'in' and a valid pillar_curated
+## Output:  diagnostic *_LLM columns in CLASSIFICATION_TABLE, plus LABELLED_TABLE - the clean final
+##          table (Dimensions metadata + curated scope/pillar + research_category) that
+##          S7_Retrieve_dataset.ipynb exports
+##
+## Only successfully labelled rows are written to LABELLED_TABLE. Failed ones simply stay missing
+## from it, which means the next run picks them up again automatically - running this script twice is
+## safe and is the normal way to retry failures.
 ## Standalone for now (not called from pipeline_publications.py)
 ## wrapped in main() so it can be wired into the pipeline later without changes.
 ## Can be run standalone (uses CONFIG defaults) or imported and called as main().
@@ -25,11 +43,16 @@ LABELLED_TABLE = 'publications_labelled'
 # Curated columns
 # these are added to CLASSIFICATION_TABLE by manual review and don't exist yet as of writing
 # this script; update the names here if they end up called something else
+# (both columns exist by now - they are created by S5_Review_classifications.ipynb. If this script
+# fails with "column not found", the review step has not been run for this data yet.)
 SCOPE_COL = 'scope_curated'
 PILLAR_COL = 'pillar_curated'
 
 # LLM
 # one system prompt per pillar; files are added separately to llm_prompts/
+# each prompt describes the categories of that pillar; the enum of allowed values is built from
+# PILLAR_CATS further down. Prompt and category list must stay consistent - if you add a category to
+# a prompt file, add it to the corresponding *_CATS list as well, otherwise the model cannot return it.
 PROMPT_PATHS = {
     'PB': 'llm_prompts/category_prompt_publications_PB.md',
     'F':  'llm_prompts/category_prompt_publications_F.md',
@@ -37,13 +60,16 @@ PROMPT_PATHS = {
     'CC': 'llm_prompts/category_prompt_publications_CC.md',
 }
 LLM_MODEL_LABEL = 'claude-sonnet-4-6'  # or 'claude-haiku-4-5' for cheap test runs
+# the answer is only two category names, so a small limit is enough here (S3 allows 512)
 MAX_TOKENS = 150
+# 0.0 = deterministic, as in S3: category assignment should be reproducible
 TEMPERATURE = 0.0
 
 # Batch
 # directory for batch submission metadata, keyed by RUN_LABEL (allows resuming without resubmitting)
 BATCH_DIR = 'batch_jobs'
 # how often to check whether the batch has finished
+# 300 s = 5 min; shorter than in S3 because these requests are small and usually finish quickly
 POLL_INTERVAL_SECONDS = 300
 # identifies this run's batch metadata file. Leave as None: on each call, the script first looks
 # in BATCH_DIR for a run that was submitted but never finished (no "completed_at" in its metadata,
@@ -55,6 +81,10 @@ RUN_LABEL = None
 # Research categories allowed per pillar, used to build each tool call's enum.
 # Hardcoded from the latest tested prompt version (see Publications/GenAI/genai_rescat_testing.ipynb)
 # update by hand if the categories in the prompt files change.
+# the lists differ per pillar on purpose (e.g. "Cell line development" only exists for CM), and
+# several categories appear in more than one pillar. The order does not matter; the exact spelling
+# does, because the strings the model returns are matched against these lists (see
+# _normalise_category() - only the letter case is tolerated).
 PB_CATS = ["Crop development", "Strain development", "Ingredient optimisation", "End product formulation", "Texturization methods", "Food safety & quality", "Health & nutrition", "Consumer & market research", "Impact assessments", "Other"]
 F_CATS  = ["Feedstocks", "Target molecule selection", "Strain development", "Bioprocess design", "Ingredient optimisation", "End product formulation", "Texturization methods", "Food safety & quality", "Health & nutrition", "Consumer & market research", "Impact assessments", "Other"]
 CM_CATS = ["Cell line development", "Cell culture media", "Bioprocess design", "Scaffolding", "End product formulation", "Food safety & quality", "Health & nutrition", "Consumer & market research", "Impact assessments", "Other"]
@@ -78,6 +108,10 @@ NESTED_JSON_COLS = ('authors', 'funder_countries', 'research_org_cities', 'resea
 
 # START OF SCRIPT
 
+## _build_category_tool
+## builds the tool definition for one pillar: the 'enum' restricts the answer to that pillar's
+## categories, and both 'primary' and 'secondary' are required so a second-best category is always
+## returned as well (stored for QA, but only 'primary' ends up in the final dataset)
 def _build_category_tool(categories):
     return {
         "name": "label_research_category",
@@ -101,9 +135,13 @@ def _build_category_tool(categories):
     }
 
 
+## _normalise_category
+## maps a category string returned by the model back onto the official spelling
 def _normalise_category(value, categories):
     # the LLM sometimes returns different casing (e.g. "Health & Nutrition") despite the enum
     # constraint; look up case-insensitively and treat anything else as unparseable
+    # anything that is not in the list becomes None, which makes the row a 'parse_error' below -
+    # i.e. invented categories never reach the database
     if not isinstance(value, str):
         return None
     return {c.lower(): c for c in categories}.get(value.strip().lower())
@@ -185,6 +223,8 @@ def main(
             data = db.sql(f"SELECT * FROM {CLASSIFICATION_TABLE}").df()
             print(f"{len(data)} rows loaded from '{CLASSIFICATION_TABLE}'")
 
+            # the curated scope, not scope_LLM: only what a human confirmed (or what the review
+            # notebook accepted automatically) is labelled here
             data = data[data[SCOPE_COL] == 'in'].reset_index(drop=True)
             print(f"{len(data)} rows in scope (curated).")
 
@@ -197,6 +237,9 @@ def main(
             else:
                 print(f"'{LABELLED_TABLE}' does not exist yet, will be created.")
 
+            # rows without a usable pillar are dropped: there is no category list for them, so they
+            # cannot be labelled. If this number is unexpectedly high, the review step probably left
+            # pillar_curated empty (or set to 'manual_review') for those rows.
             n_before = len(data)
             data = data[data[PILLAR_COL].isin(PILLAR_CATS.keys())].reset_index(drop=True)
             if n_before - len(data) > 0:
@@ -215,6 +258,8 @@ def main(
                 system_prompts[pillar] = f.read().strip()
             tools[pillar] = _build_category_tool(PILLAR_CATS[pillar])
 
+        # the pillar decides which prompt and which tool schema a request gets - that is the only
+        # difference between the requests in this batch
         def build_batch_request(row):
             pillar = row[PILLAR_COL]
             user_message = f"Title: {row['title']}\n\nAbstract: {row['abstract']}"
@@ -258,6 +303,9 @@ def main(
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         print(f"Batch metadata saved to {metadata_path}")
 
+    # needed when parsing the results: to check a returned category, you have to know which pillar's
+    # list it belongs to. Read from the metadata file rather than from the database, so a resumed run
+    # uses the pillar assignment as it was at submission time.
     pillar_by_id = metadata["pillar_by_id"]
 
     # 4. Poll until the batch has finished
@@ -304,6 +352,9 @@ def main(
         "stop_reason": "category_stop_reason_LLM",
     })
 
+    # worth checking: only the 'ok' rows end up in LABELLED_TABLE. A large gap between the two
+    # numbers means many requests failed or returned an unusable category - those rows are picked up
+    # again on the next run.
     n_ok = (results_df["category_status_LLM"] == "ok").sum()
     print(f"Results: {len(results_df)} total, {n_ok} succeeded.")
 
@@ -373,6 +424,8 @@ def main(
             JOIN ok_ids USING (id)
         """).df()
 
+        # the final table only carries the primary category, under the plain name 'research_category'.
+        # secondary_category_LLM stays in CLASSIFICATION_TABLE for QA and is not exported.
         labelled_data = labelled_data.merge(
             results_df.loc[results_df["category_status_LLM"] == "ok", ["id", "primary_category_LLM"]],
             on="id", how="left"
@@ -406,5 +459,7 @@ def main(
     print("\nDone!")
 
 
+# only executed when the file is started directly (python S6_LLM_labelling.py) - this step is not
+# part of pipeline_publications.py and is currently always started by hand after the review
 if __name__ == '__main__':
     main()

@@ -1,10 +1,31 @@
+## STEP 2 of the patents pipeline
 ## Classification script: embed new input data and run through trained classifiers
+##
+## What it does: the fast, cheap pre-filter. Patents are embedded with PatentSBERTa and run through
+## the two classifiers from S0_ML_training.py; the result is 'pred_combined', which decides what goes
+## on to the expensive LLM step (S3). In scope if EITHER the scope classifier says so OR the pillar
+## classifier assigns a pillar other than 'NA'.
+##
+## The key difference from the publications version is that everything happens PER FAMILY - and there
+## are two cases:
+##   Known families   - a patent of that family has been classified before: its predictions are
+##                      copied across, no embedding, no model, no cost.
+##   New families     - one representative is chosen per family (preferably one with title and
+##                      abstract, from WO/EP/US, newest), only that one is embedded and classified,
+##                      and its result is propagated to every family member.
+## This is what makes the step affordable: one classification per invention instead of one per
+## document. The price is that all members of a family always share the same verdict.
+##
+## Input:   RUN_TABLE (written by S1_query_dimensions.py) and the model files from S0
+## Output:  prediction columns in RUN_TABLE, the rows appended to CLASSIFICATION_TABLE, and the
+##          representatives' embeddings in EMBEDDINGS_TABLE
 ## Can be run standalone (uses CONFIG defaults) or imported and called as main().
 
 import importlib.util, os
 
 # CONFIG
 # edit parameters for this run here
+# NOTE: started through pipeline_patents.py, these are overridden by the pipeline's own CONFIG.
 
 # Database
 # path to DuckDB database
@@ -12,22 +33,31 @@ DB_PATH = 'patents.db'
 # table containing the new input data to classify with run date as name
 RUN_TABLE = 'data_run_test'
 # table for embeddings
+# only ever holds the family representatives - the other family members inherit their predictions
+# and are never embedded
 EMBEDDINGS_TABLE = 'patents_embeddings'
 # table for final classifications
+# the accumulating main table; the classified rows of this run are appended to it
 CLASSIFICATION_TABLE = 'patents_classified'
 
 # Columns
 # columns concatenated for embedding (title, abstract)
+# must be exactly the same combination as in S0_ML_training.py
 TEXT_COLUMNS = ('title', 'abstract')
 
 # Embeddings
 # save path for embeddings (checkpoint + final)
+# .npy checkpoint written after every batch; the pipeline gives every run its own file. When running
+# standalone, use a fresh name per run - the checkpoint counts rows, it does not know which patents
+# they belong to (see get_embeddings()).
 EMBEDDINGS_PATH = 'embeddings_run_test.npy'
 
 # Model paths
-SCOPE_MODEL_PATH  = 'Models/LR_scope.joblib'
-PILLAR_MODEL_PATH = 'Models/LR_pillar.joblib'
-THRESHOLD_PATH    = 'Models/LR_scope_threshold.txt'
+# the files produced by S0_ML_training.py. Despite the 'LR_' prefix these are SVC models for patents
+# (the name was kept from the publications pipeline) - the code does not care, it just loads them.
+SCOPE_MODEL_PATH  = 'models/LR_scope.joblib'
+PILLAR_MODEL_PATH = 'models/LR_pillar.joblib'
+THRESHOLD_PATH    = 'models/LR_scope_threshold.txt'
 
 # START OF SCRIPT
 
@@ -42,9 +72,14 @@ def main(
     PILLAR_MODEL_PATH=PILLAR_MODEL_PATH,
     THRESHOLD_PATH=THRESHOLD_PATH,
 ):
+    # torch and numpy/MKL each bring their own OpenMP runtime on Windows, which can crash with
+    # "libomp.dll already initialized" when both end up in the same process. Set before torch and
+    # the transformer libraries are loaded below.
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
     # 1. Load ML_pipeline_functions from the same directory as this script
+    # loaded by file path rather than a normal import so the script also works from another working
+    # directory; mlf then holds the embedding/classification functions of that module
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _spec = importlib.util.spec_from_file_location(
         'ML_pipeline_patents_functions',
@@ -65,6 +100,8 @@ def main(
     print(f"{len(data)} rows loaded from '{RUN_TABLE}'")
 
     # Prediction columns to be added to RUN_TABLE
+    # created up front (empty) for both cases below, because known and new families are written back
+    # separately. ADD COLUMN IF NOT EXISTS makes this safe to re-run.
     new_columns = {
         'embeddings':      'DOUBLE[]',
         'truncated':       'BOOLEAN',
@@ -80,6 +117,8 @@ def main(
         db.sql(f"ALTER TABLE {RUN_TABLE} ADD COLUMN IF NOT EXISTS {col} {dtype}")
 
     # 3. Split into known families (already classified) and new families
+    # the central decision of this script: known families cost nothing (step 4), new ones are
+    # embedded and classified (step 5). The split is purely by family_id.
     existing_tables = db.sql("SHOW TABLES").df()['name'].tolist()
 
     if CLASSIFICATION_TABLE in existing_tables:
@@ -100,6 +139,10 @@ def main(
         new_data = data.copy()
         print(f"No existing classification table. All {len(new_data)} rows treated as new.")
 
+    # nested Dimensions fields (lists, lists of dicts) are stored as JSON text in
+    # CLASSIFICATION_TABLE: their native shape can differ between queries, which makes a plain INSERT
+    # into the already-typed table fail. JSON text is stable regardless of shape - but it means these
+    # columns have to be parsed again for analysis (S5_Assignee_cleanup.py does exactly that).
     import json as _json
     def _to_json(x):
         if isinstance(x, str):
@@ -111,10 +154,15 @@ def main(
         return _json.dumps(x, ensure_ascii=False)
 
     # 4. Known families: propagate pred_combined and pred_pillar from classification table
+    # no model runs here at all - the verdict of the family is simply adopted. Note the consequence:
+    # if the models are retrained, these patents keep the OLD family verdict; only entirely new
+    # families are scored with the new models.
     if not known_data.empty:
         print(f"\nPropagating predictions for known families.")
 
         # pred_combined is stored as 'in'/'out' in CLASSIFICATION_TABLE — convert back to int
+        # DISTINCT ON (family_id) takes an arbitrary row per family - fine here, because all members
+        # of a family carry the same predictions by construction
         family_preds = db.sql(f"""
             SELECT DISTINCT ON (family_id)
                 family_id,
@@ -165,6 +213,13 @@ def main(
     if not new_data.empty:
 
         # Select one representative per family for embedding
+        # the priority order matters and is used identically in S3_LLM_scope.py and
+        # S7_LLM_labelling.py - the same document should represent a family everywhere:
+        #   1. must have a title AND an abstract (without text there is nothing to classify)
+        #   2. prefer jurisdictions WO/EP/US - these usually carry the fullest English text
+        #   3. of those, the newest publication_year
+        #   4. if no member has title+abstract at all: simply the newest one (it will be classified
+        #      on an almost empty text, which is why such families are usually filtered out)
         def select_patent(group):
             preferred_jurisdictions = ['WO', 'EP', 'US']
             has_content = group[
@@ -186,9 +241,12 @@ def main(
         reps = new_data.groupby('family_id', group_keys=True).apply(select_patent).reset_index(level=0).reset_index(drop=True)
         print(f"\n{len(reps)} representative patents selected from {new_data['family_id'].nunique()} new families.")
 
+        # same '[SEP]' construction as during training - the models must see the same kind of text
         reps['text'] = reps[TEXT_COLUMNS[0]].fillna('') + ' [SEP] ' + reps[TEXT_COLUMNS[1]].fillna('')
 
         # Load PatentSBERTa model and check token sizes
+        # PatentSBERTa is trained on patent text (the publications pipeline uses SPECTER2 instead);
+        # downloaded from Hugging Face on first use and cached locally
         print("\nLoading PatentSBERTa model.")
         model = mlf.load_patentsberta()
         mlf.check_token_size(reps, text_column='text', model=model, add_column=True)
@@ -215,6 +273,9 @@ def main(
             db.sql(f"CREATE TABLE {EMBEDDINGS_TABLE} AS SELECT * FROM data_embeddings")
 
         # Run scope classifier
+        # the threshold comes from training and is not part of the model file: in scope if the
+        # probability is >= threshold. Usually well below 0.5, because training accepted at most
+        # MAX_FN false negatives.
         print("\nRunning scope classifier.")
         with open(THRESHOLD_PATH, 'r') as f:
             threshold = float(f.read().strip())
@@ -232,12 +293,17 @@ def main(
         reps['pred_pillar']  = pred_pillar
 
         # Combine predictions
+        # OR logic: in scope if the scope classifier says so, or if a pillar other than 'NA' was
+        # assigned. Deliberately generous - the LLM step sorts out the false positives.
         reps['pred_combined'] = mlf.combine_classifications(pred_scope, pred_pillar)
+        # date of the ML classification (yymmdd); useful for selecting one run's records later
         reps['date_ML'] = datetime.today().strftime('%y%m%d')
         in_scope_n = reps['pred_combined'].sum()
         print(f"Predicted in scope: {in_scope_n} / {len(reps)} ({in_scope_n / len(reps):.1%})")
 
         # Propagate predictions from representative to all members of the same family
+        # the merge on family_id gives every member the representative's values - this is the step
+        # that turns "one classification" into "the whole family classified"
         pred_cols = [c for c in new_columns if c in reps.columns]
         _drop = [c for c in pred_cols if c in new_data.columns]
         new_data = new_data.drop(columns=_drop).merge(reps[['family_id'] + pred_cols], on='family_id', how='left')
@@ -273,6 +339,9 @@ def main(
         _seen = set()
         output_columns = [c for c in output_columns if c not in _seen and not _seen.add(c)]
 
+        # note the difference in representation: pred_combined is 0/1 in RUN_TABLE but 'in'/'out' in
+        # CLASSIFICATION_TABLE. Both spellings appear downstream - S3_LLM_scope.py filters the run
+        # table on == 1, the review notebook filters the classification table on 'in'/'out'.
         data_classified = new_data.reindex(columns=output_columns).copy()
         data_classified['pred_combined'] = data_classified['pred_combined'].map({1: 'in', 0: 'out'})
         _nested = ['cpc', 'inventor_names', 'assignee_names', 'assignee_cities',
@@ -294,5 +363,6 @@ def main(
     print("\nDone!")
 
 
+# only executed when the file is started directly (python S2_ML_classification.py)
 if __name__ == '__main__':
     main()
