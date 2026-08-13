@@ -493,17 +493,6 @@ def main(
     )
     already_promoted_ids = set(curated_df['Identification code'].dropna().astype(str))
 
-    # Grants deliberately removed via manual LLM-label review (e.g. "out of scope") - excluded
-    # from Pool A and promotion so one can never be re-promoted into funding_curated after being
-    # removed. S2_grant_deduplication.ipynb applies the same table to the Grants-Tracker/
-    # last-report rebuild path.
-    db.sql('''
-        CREATE TABLE IF NOT EXISTS manual_exclusions (
-            join_key VARCHAR PRIMARY KEY, reason VARCHAR, date_added VARCHAR
-        )
-    ''')
-    manually_excluded_ids = set(db.sql("SELECT join_key FROM manual_exclusions").df()['join_key'])
-
     # Stop reasons that mean the LLM's attempt didn't actually finish for a reason a retry can fix
     # - unlike a normal 'tool_use' completion that legitimately flagged nothing true (that's a
     # real, final answer, not a failure), and unlike 'refusal' (the model declined to answer at
@@ -524,7 +513,6 @@ def main(
         mask = (
             (fc[SCOPE_COL] == 'in')
             & (~fc['Grant ID'].astype(str).isin(already_promoted_ids))
-            & (~fc['Grant ID'].astype(str).isin(manually_excluded_ids))
         )
         if stage['pillar_split']:
             mask &= fc[PILLAR_COL].isin(stage['valid_pillars'])
@@ -780,8 +768,7 @@ def main(
         # forever, since Pool A's new_only filter also excludes any row with a non-null status.
         to_promote = fc_full[
             (fc_full[rescat_stage['classified_status_col']].notna()) &
-            (~fc_full['Grant ID'].astype(str).isin(already_promoted_ids)) &
-            (~fc_full['Grant ID'].astype(str).isin(manually_excluded_ids))
+            (~fc_full['Grant ID'].astype(str).isin(already_promoted_ids))
         ]
 
         if len(to_promote):
@@ -853,7 +840,7 @@ def main(
     # and anything left unresolved from a prior run's review in one pass. Unlike S2's within-one-
     # session pause/resume, this review can span many separate S6 runs (Dimensions promotion is an
     # ongoing background process, not a single interactive session) - so every run first checks
-    # every past export/REVIEWED.csv pair sitting in REVIEW_DIR for anything now resolved, applies
+    # every past export/reviewed.csv pair sitting in REVIEW_DIR for anything now resolved, applies
     # those, then exports a fresh snapshot of whatever's still blank afterward. Idempotent either way.
     REVIEW_DIR = Path('data_review')
     REVIEW_DIR.mkdir(exist_ok=True)
@@ -861,7 +848,7 @@ def main(
 
     n_reviews_applied = 0
     for original_path in sorted(REVIEW_DIR.glob('*_dimensions_funder_type_for_review.csv')):
-        reviewed_path = Path(str(original_path).replace('.csv', '_REVIEWED.csv'))
+        reviewed_path = Path(str(original_path).replace('_for_review.csv', '_reviewed.csv'))
         if not reviewed_path.exists():
             continue
         original_export = pd.read_csv(original_path)
@@ -907,7 +894,7 @@ def main(
             default='',
         )
         print(f"Exported for manual review to {REVIEW_DIR}/. Fill in 'Funder type', save as "
-              f"'..._REVIEWED.csv' in the same folder, then rerun S6 to apply.")
+              f"'..._reviewed.csv' in the same folder, then rerun S6 to apply.")
 
     # 8. Persist funding_curated once, atomically, with every stage's Pool B updates and any
     # newly-promoted rows
