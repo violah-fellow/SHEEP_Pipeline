@@ -31,6 +31,8 @@ Funding/data_audit/*
 Funding/data_review/*
 Funding/data_output/*
 Funding/raw_data/*
+Funding/Funding_analysis.ipynb
+Funding/Funding_analysis_R.ipynb
 
 .env
 .claude/*
