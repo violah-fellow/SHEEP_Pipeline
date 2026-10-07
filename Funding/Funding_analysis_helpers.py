@@ -51,6 +51,10 @@ EU_27 = {
 }
 EU_PLUS = EU_27 | {'United Kingdom', 'Switzerland', 'Norway'}
 
+# Countries of interest with reliable funding information
+COI = {'EU', 'Germany', 'Denmark', 'Sweden', 'Finland', 'United Kingdom', 'Norway', 
+       'United States', 'Canada', 'Singapore', 'South Korea', 'Japan', 'Israel'}
+
 
 def europe_tier_split(df, country_col='Funder Country', delimiter=','):
     """Explode country_col the same way as split_multi_value, then tag each exploded (grant,

@@ -8,7 +8,7 @@ Publications/__pycache__/*
 Publications/publications.db
 Publications/publications.db.wal
 Publications/Data_analysis.ipynb
-Publications/Data_analysis_python.ipynb
+Publications/Data_analysis_python_researchers.ipynb
 
 Patents/data/*
 Patents/embeddings/*
@@ -31,7 +31,6 @@ Funding/data_audit/*
 Funding/data_review/*
 Funding/data_output/*
 Funding/raw_data/*
-Funding/Funding_analysis.ipynb
 Funding/Funding_analysis_R.ipynb
 
 .env
